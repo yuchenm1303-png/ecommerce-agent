@@ -84,13 +84,61 @@ jobs:
           dotnet tool run vpk -- --help *> $null
           if ($LASTEXITCODE -ne 0) { throw "Pinned Velopack CLI failed to start: $LASTEXITCODE" }
 
-      - name: Verify Windows installer and lifecycle contracts
+      - name: Compile native installer bootstrapper before heavy build
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere -PathType Leaf)) { throw "Visual Studio Build Tools locator missing: $vswhere" }
+          $vsRoot = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -latest -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vsRoot)) { throw "MSVC Build Tools workload is missing" }
+          $msbuild = Join-Path $vsRoot "MSBuild\Current\Bin\MSBuild.exe"
+          & $msbuild native\installer-bootstrapper\EcommerceAgentInstaller.vcxproj /restore /m /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { throw "Native installer bootstrapper compile failed: $LASTEXITCODE" }
+
+      - name: Verify Windows installer and release contracts before heavy build
         shell: pwsh
         run: |
           python -m pytest -q `
+            tests/test_release_parity_contract.py `
+            tests/test_windows_packaging_contract.py `
+            tests/test_customer_installer_contract.py `
             tests/test_velopack_lifecycle_api.py `
             tests/test_velopack_update_contract.py `
             tests/test_updater_browser_shutdown_contract.py
+
+  windows-installer-e2e:
+    runs-on: windows-2025
+    needs: windows-updater-contract
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"
+          cache: pip
+          cache-dependency-path: requirements-release.lock
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.424"
+
+      - name: Install isolated release environment
+        shell: pwsh
+        run: .\scripts\install_release_environment.ps1
+
+      - name: Build and prove install-update-restart-uninstall
+        shell: pwsh
+        run: |
+          .\scripts\build_windows.ps1 `
+            -Version "0.0.2" `
+            -Channel "win-x64-ci" `
+            -RunUpdateE2E
 
   tests:
     runs-on: ubuntu-latest

@@ -22,7 +22,13 @@ RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 QUICK_BATCH = (ROOT / "gui" / "quick_batch_list.py").read_text(encoding="utf-8")
 SPEC = (ROOT / "packaging" / "EcommerceAgent.spec").read_text(encoding="utf-8")
 BUILD = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
+E2E = (ROOT / "scripts" / "test_velopack_update_e2e.ps1").read_text(encoding="utf-8")
+BOOTSTRAP = (ROOT / "native" / "installer-bootstrapper" / "main.cpp").read_text(encoding="utf-8")
 WINDOWS = (ROOT / ".github" / "workflows" / "windows-package.yml").read_text(encoding="utf-8")
+STABLE = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(encoding="utf-8")
+TEST_PUBLISH = (ROOT / ".github" / "workflows" / "publish-test-build.yml").read_text(encoding="utf-8")
+REQUIREMENTS = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+RELEASE_LOCK = (ROOT / "requirements-release.lock").read_text(encoding="utf-8")
 
 
 def test_packaging_python_sources_compile() -> None:
@@ -125,9 +131,12 @@ def test_worker_freeze_contract_reconciles_complete_makro_runtime_into_pyz() -> 
     assert "PyInstaller Worker freeze reconciliation failed" in SPEC
 
 
-def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
+def test_velopack_toolchain_is_pinned_once_and_python_runtime_matches_cli() -> None:
     manifest = json.loads((ROOT / ".config" / "dotnet-tools.json").read_text(encoding="utf-8"))
-    assert manifest["tools"]["vpk"]["version"] == "1.2.161"
+    version = str(manifest["tools"]["vpk"]["version"])
+    assert version
+    assert f"velopack=={version}" in REQUIREMENTS.splitlines()
+    assert f"velopack=={version}" in RELEASE_LOCK.splitlines()
     assert "dotnet tool restore" in BUILD
     assert '. (Join-Path $PSScriptRoot "velopack_cli.ps1")' in BUILD
     assert "Invoke-RepositoryVelopack" in BUILD
@@ -151,6 +160,28 @@ def test_velopack_process_boundary_removes_only_blank_reserved_environment() -> 
     assert "RemainingBlank" in VELOPACK_CLI
     assert "SetEnvironmentVariable" not in VELOPACK_CLI
     assert "Remove-Item Env:" not in VELOPACK_CLI
+
+
+def test_all_install_checks_use_canonical_velopack_layout_without_hardcoded_stub_name() -> None:
+    start = BOOTSTRAP.index("bool is_complete_install")
+    end = BOOTSTRAP.index("fs::path stale_backup_path", start)
+    complete = BOOTSTRAP[start:end]
+    assert 'root / L"Update.exe"' in complete
+    assert 'root / L"current" / kMainExe' in complete
+    assert 'root / L"current" / L"sq.version"' in complete
+    assert 'root / kMainExe' not in complete
+
+    assert '$RootGui = Join-Path $InstallDir "EcommerceAgent.exe"' not in E2E
+    assert '$RootLaunchers = @(Get-ChildItem $InstallDir -File -Filter "*.exe"' in E2E
+    assert '$CurrentGui = Join-Path $InstallDir "current\\EcommerceAgent.exe"' in E2E
+    assert '$SqVersion = Join-Path $InstallDir "current\\sq.version"' in E2E
+    assert 'Start-Process -FilePath $RootLauncher' in E2E
+
+    for workflow in (WINDOWS, STABLE, TEST_PUBLISH):
+        assert '$stub = Join-Path $installDir "EcommerceAgent.exe"' not in workflow
+        assert '$rootLaunchers = @(Get-ChildItem $installDir -File -Filter "*.exe"' in workflow
+        assert 'Join-Path $installDir "current\\EcommerceAgent.exe"' in workflow
+        assert 'Join-Path $installDir "current\\sq.version"' in workflow
 
 
 def test_windows_ci_smokes_canonical_velopack_layout_and_uninstall() -> None:
@@ -181,6 +212,15 @@ def test_build_discovers_native_assets_and_never_guesses_velopack_package_names(
     assert 'Join-Path $VelopackDir "$PackId-Setup.exe"' not in BUILD
     assert 'Join-Path $VelopackDir "$PackId-Portable.zip"' not in BUILD
     assert '"$PackId-$Version-full.nupkg"' not in BUILD
+
+
+def test_build_verifies_hydrated_release_instead_of_trusting_vpk_exit_code() -> None:
+    assert "function Test-VelopackHydratedRelease" in BUILD
+    assert '$PreviousReleaseIndex = Join-Path $VelopackDir "releases.$Channel.json"' in BUILD
+    assert "$PreviousReleaseExitCode -eq 0 -and" in BUILD
+    assert "(Test-VelopackHydratedRelease" in BUILD
+    assert "$PreviousReleaseDownloaded = ($PreviousReleaseExitCode -eq 0)" not in BUILD
+    assert "download returned success but produced no usable previous Full release" in BUILD
 
 
 def test_build_validates_feed_binding_and_has_production_signing_hooks() -> None:

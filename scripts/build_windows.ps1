@@ -59,6 +59,42 @@ function Resolve-VelopackFullPackage {
     return $Package
 }
 
+function Test-VelopackHydratedRelease {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$ReleaseIndex,
+        [Parameter(Mandatory = $true)][string]$PackageId
+    )
+
+    # vpk download may exit 0 even when the remote channel contains no release.
+    # The output directory is cleaned before download, so only a feed entry that
+    # resolves to an existing, size-matched Full package proves hydration worked.
+    if (-not (Test-Path $ReleaseIndex -PathType Leaf)) { return $false }
+    try {
+        $Feed = Get-Content $ReleaseIndex -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    catch {
+        return $false
+    }
+
+    $Candidates = @($Feed.Assets | Where-Object {
+        [string]$_.PackageId -eq $PackageId -and [string]$_.Type -eq "Full"
+    })
+    foreach ($Candidate in $Candidates) {
+        $FileName = [string]$Candidate.FileName
+        if ([string]::IsNullOrWhiteSpace($FileName) -or [IO.Path]::GetFileName($FileName) -ne $FileName) {
+            continue
+        }
+        $PackagePath = Join-Path $Directory $FileName
+        if (-not (Test-Path $PackagePath -PathType Leaf)) { continue }
+        $Package = Get-Item $PackagePath
+        if ([int64]$Candidate.Size -eq [int64]$Package.Length) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Resolve-VelopackDeltaPackage {
     param(
         [Parameter(Mandatory = $true)][string]$Directory,
@@ -192,7 +228,17 @@ $PreviousReleaseExitCode = Invoke-RepositoryVelopack -Arguments @(
     "--outputDir", $VelopackDir,
     "--timeout", "10"
 )
-$PreviousReleaseDownloaded = ($PreviousReleaseExitCode -eq 0)
+$PreviousReleaseIndex = Join-Path $VelopackDir "releases.$Channel.json"
+$PreviousReleaseDownloaded = (
+    $PreviousReleaseExitCode -eq 0 -and
+    (Test-VelopackHydratedRelease `
+        -Directory $VelopackDir `
+        -ReleaseIndex $PreviousReleaseIndex `
+        -PackageId $PackId)
+)
+if ($PreviousReleaseExitCode -eq 0 -and -not $PreviousReleaseDownloaded) {
+    Write-Host "Velopack download returned success but produced no usable previous Full release for channel $Channel."
+}
 if (-not $PreviousReleaseDownloaded) {
     if ($IsStablePublication) {
         throw "Stable publication requires the previous public Velopack release so a delta update can be generated."

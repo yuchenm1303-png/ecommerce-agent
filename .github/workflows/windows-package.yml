@@ -34,6 +34,7 @@ on:
       - "requirements.txt"
       - "requirements-gui.txt"
       - "requirements-build.txt"
+      - "requirements-release.lock"
       - "tests/test_batch_architecture_contract.py"
       - "tests/test_cdp_transport_lane.py"
       - "tests/test_customer_installer_contract.py"
@@ -134,14 +135,18 @@ jobs:
             throw "Customer installer left stale rollback directories behind: $($staleBackups.FullName -join ', ')"
           }
 
-          $stub = Join-Path $installDir "EcommerceAgent.exe"
           $update = Join-Path $installDir "Update.exe"
           $gui = Join-Path $installDir "current\EcommerceAgent.exe"
+          $sqVersion = Join-Path $installDir "current\sq.version"
           $worker = Join-Path $installDir "current\EcommerceAgentWorker.exe"
           $sakana = Join-Path $installDir "current\_internal\native\sakana\helper\EcommerceAgentSakana.exe"
           $versionFile = Join-Path $installDir "current\_internal\packaging\VERSION"
-          foreach ($required in @($stub, $update, $gui, $worker, $sakana, $versionFile)) {
-            if (-not (Test-Path $required)) { throw "Velopack installed component missing: $required" }
+          foreach ($required in @($update, $gui, $sqVersion, $worker, $sakana, $versionFile)) {
+            if (-not (Test-Path $required -PathType Leaf)) { throw "Velopack installed component missing: $required" }
+          }
+          $rootLaunchers = @(Get-ChildItem $installDir -File -Filter "*.exe" | Where-Object { $_.Name -ne "Update.exe" })
+          if ($rootLaunchers.Count -ne 1) {
+            throw "Expected exactly one Velopack root execution stub, found $($rootLaunchers.Count): $($rootLaunchers.Name -join ', ')"
           }
           $installedVersion = (Get-Content $versionFile -Raw).Trim()
           if ($installedVersion -ne $expectedVersion) {
