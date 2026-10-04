@@ -111,7 +111,7 @@ def test_release_lock_is_exact_and_covers_packaged_top_level_dependencies() -> N
         "PySide6==6.11.2",
         "PyInstaller==6.22.2",
         "pypinyin==0.55.0",
-        "velopack==1.2.0",
+        "velopack==1.2.161",
     ):
         assert expected in requirements
 
