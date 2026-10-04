@@ -84,6 +84,17 @@ jobs:
           dotnet tool run vpk -- --help *> $null
           if ($LASTEXITCODE -ne 0) { throw "Pinned Velopack CLI failed to start: $LASTEXITCODE" }
 
+      - name: Compile native installer bootstrapper before heavy build
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere -PathType Leaf)) { throw "Visual Studio Build Tools locator missing: $vswhere" }
+          $vsRoot = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -latest -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vsRoot)) { throw "MSVC Build Tools workload is missing" }
+          $msbuild = Join-Path $vsRoot "MSBuild\Current\Bin\MSBuild.exe"
+          & $msbuild native\installer-bootstrapper\EcommerceAgentInstaller.vcxproj /restore /m /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { throw "Native installer bootstrapper compile failed: $LASTEXITCODE" }
+
       - name: Verify Windows installer and release contracts before heavy build
         shell: pwsh
         run: |
