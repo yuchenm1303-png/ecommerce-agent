@@ -1,5 +1,9 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -131,9 +135,12 @@ bool uninstall_registration_matches(const fs::path& root) {
 }
 
 bool is_complete_install(const fs::path& root) {
+    // Velopack's stable contract is Update.exe at the install root plus the
+    // real application and sq.version under current/. The optional/friendly
+    // root execution-stub filename is packaging metadata and must not be used
+    // to decide that an otherwise healthy installation is stale.
     std::error_code ec;
     return fs::is_regular_file(root / L"Update.exe", ec)
-        && fs::is_regular_file(root / kMainExe, ec)
         && fs::is_regular_file(root / L"current" / kMainExe, ec)
         && fs::is_regular_file(root / L"current" / L"sq.version", ec)
         && uninstall_registration_matches(root);
