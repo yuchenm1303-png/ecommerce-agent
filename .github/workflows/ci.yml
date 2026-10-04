@@ -95,6 +95,40 @@ jobs:
             tests/test_velopack_update_contract.py `
             tests/test_updater_browser_shutdown_contract.py
 
+  windows-installer-e2e:
+    runs-on: windows-2025
+    needs: windows-updater-contract
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"
+          cache: pip
+          cache-dependency-path: requirements-release.lock
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.424"
+
+      - name: Install isolated release environment
+        shell: pwsh
+        run: .\scripts\install_release_environment.ps1
+
+      - name: Build and prove install-update-restart-uninstall
+        shell: pwsh
+        run: |
+          .\scripts\build_windows.ps1 `
+            -Version "0.0.2" `
+            -Channel "win-x64-ci" `
+            -RunUpdateE2E
+
   tests:
     runs-on: ubuntu-latest
     steps:
