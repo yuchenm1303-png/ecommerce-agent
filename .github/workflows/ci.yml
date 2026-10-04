@@ -158,10 +158,9 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Start legacy mock seller site
-        run: python -m http.server 8000 --directory mock_site >/tmp/mock-site.log 2>&1 &
-
-      - name: Wait for legacy mock seller site
-        run: sleep 1
+        run: |
+          python -m http.server 8000 --directory mock_site >/tmp/mock-site.log 2>&1 &
+          sleep 1
 
       - name: Run legacy browser automation dry-run
         run: python main.py --headless --dry-run
