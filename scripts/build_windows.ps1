@@ -67,29 +67,53 @@ function Test-VelopackHydratedRelease {
     )
 
     # vpk download may exit 0 even when the remote channel contains no release.
-    # The output directory is cleaned before download, so only a feed entry that
-    # resolves to an existing, size-matched Full package proves hydration worked.
-    if (-not (Test-Path $ReleaseIndex -PathType Leaf)) { return $false }
-    try {
-        $Feed = Get-Content $ReleaseIndex -Raw -Encoding UTF8 | ConvertFrom-Json
-    }
-    catch {
-        return $false
+    # Prefer a feed-backed size check when the download command persisted the
+    # remote release index, but do not require that index: Velopack's GitHub
+    # downloader can legitimately hydrate only the latest Full .nupkg. The output
+    # directory is cleaned immediately before download, so a readable Full package
+    # belonging to this package id is sufficient proof for delta generation.
+    if (Test-Path $ReleaseIndex -PathType Leaf) {
+        try {
+            $Feed = Get-Content $ReleaseIndex -Raw -Encoding UTF8 | ConvertFrom-Json
+            $Candidates = @($Feed.Assets | Where-Object {
+                [string]$_.PackageId -eq $PackageId -and [string]$_.Type -eq "Full"
+            })
+            foreach ($Candidate in $Candidates) {
+                $FileName = [string]$Candidate.FileName
+                if ([string]::IsNullOrWhiteSpace($FileName) -or [IO.Path]::GetFileName($FileName) -ne $FileName) {
+                    continue
+                }
+                $PackagePath = Join-Path $Directory $FileName
+                if (-not (Test-Path $PackagePath -PathType Leaf)) { continue }
+                $Package = Get-Item $PackagePath
+                if ([int64]$Candidate.Size -eq [int64]$Package.Length) {
+                    return $true
+                }
+            }
+        }
+        catch {
+            Write-Host "Downloaded Velopack release index could not be validated; checking hydrated Full package directly."
+        }
     }
 
-    $Candidates = @($Feed.Assets | Where-Object {
-        [string]$_.PackageId -eq $PackageId -and [string]$_.Type -eq "Full"
+    $DownloadedFullPackages = @(Get-ChildItem -Path $Directory -File -Filter "$PackageId-*-full.nupkg" -ErrorAction SilentlyContinue | Where-Object {
+        $_.Length -gt 0
     })
-    foreach ($Candidate in $Candidates) {
-        $FileName = [string]$Candidate.FileName
-        if ([string]::IsNullOrWhiteSpace($FileName) -or [IO.Path]::GetFileName($FileName) -ne $FileName) {
-            continue
+    foreach ($Package in $DownloadedFullPackages) {
+        $Archive = $null
+        try {
+            $Archive = [IO.Compression.ZipFile]::OpenRead($Package.FullName)
+            $HasNuspec = @($Archive.Entries | Where-Object { $_.FullName -like "*.nuspec" }).Count -gt 0
+            if ($HasNuspec) {
+                Write-Host "Verified hydrated previous Velopack Full package: $($Package.Name)"
+                return $true
+            }
         }
-        $PackagePath = Join-Path $Directory $FileName
-        if (-not (Test-Path $PackagePath -PathType Leaf)) { continue }
-        $Package = Get-Item $PackagePath
-        if ([int64]$Candidate.Size -eq [int64]$Package.Length) {
-            return $true
+        catch {
+            Write-Host "Ignoring unreadable hydrated Velopack package: $($Package.Name)"
+        }
+        finally {
+            if ($null -ne $Archive) { $Archive.Dispose() }
         }
     }
     return $false
