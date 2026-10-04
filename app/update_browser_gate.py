@@ -1,9 +1,13 @@
 """Close only Listing Studio's managed Edge before an in-place Windows upgrade.
 
 The formal GUI owns one dedicated Microsoft Edge instance through the reserved
-localhost CDP port 9222.  Update shutdown must never kill arbitrary user Edge
+localhost CDP port 9222. Update shutdown must never kill arbitrary user Edge
 windows by image name; ownership is proven by the TCP listener PID and then by
 that PID's exact ``msedge.exe`` image identity.
+
+This module intentionally depends only on the Python standard library. Velopack
+executes lifecycle hooks before the Qt application is started, so the same
+browser cleanup must also be safe to call from that fast, headless process.
 """
 
 from __future__ import annotations
@@ -26,6 +30,12 @@ from typing import Callable
 DEFAULT_CDP_PORT = 9222
 OWNED_BROWSER_IMAGE = "msedge.exe"
 _CREATE_NO_WINDOW = 0x08000000
+_DEFAULT_COMMAND_TIMEOUT_S = 15.0
+_DEFAULT_CDP_TIMEOUT_S = 5.0
+_VELOPACK_HOOK_COMMAND_TIMEOUT_S = 1.0
+_VELOPACK_HOOK_CDP_TIMEOUT_S = 1.0
+_VELOPACK_HOOK_GRACEFUL_DEADLINE_S = 1.5
+_VELOPACK_HOOK_CLOSE_DEADLINE_S = 1.5
 ProgressCallback = Callable[[str], None]
 
 
@@ -59,7 +69,7 @@ def _endpoint_port(value: str) -> int:
         return 0
 
 
-def listener_pid(port: int) -> int:
+def listener_pid(port: int, *, command_timeout_s: float = _DEFAULT_COMMAND_TIMEOUT_S) -> int:
     """Return the PID listening on the reserved local CDP port, or 0."""
 
     wanted = int(port)
@@ -70,7 +80,7 @@ def listener_pid(port: int) -> int:
             ["netstat", "-ano", "-p", "tcp"],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=max(0.5, float(command_timeout_s)),
             creationflags=_CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
@@ -96,7 +106,7 @@ def listener_pid(port: int) -> int:
     return 0
 
 
-def _pid_image_name(pid: int) -> str:
+def _pid_image_name(pid: int, *, command_timeout_s: float = _DEFAULT_COMMAND_TIMEOUT_S) -> str:
     if int(pid) <= 0 or os.name != "nt":
         return ""
     try:
@@ -104,7 +114,7 @@ def _pid_image_name(pid: int) -> str:
             ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=max(0.5, float(command_timeout_s)),
             creationflags=_CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
@@ -124,13 +134,13 @@ def _pid_image_name(pid: int) -> str:
     return ""
 
 
-def _browser_websocket_url(port: int) -> str:
+def _browser_websocket_url(port: int, *, timeout_s: float = _DEFAULT_CDP_TIMEOUT_S) -> str:
     """Return the browser-level CDP WebSocket URL, or "" when unreachable."""
 
     try:
         with urllib.request.urlopen(
             f"http://127.0.0.1:{int(port)}/json/version",
-            timeout=5,
+            timeout=max(0.25, float(timeout_s)),
         ) as response:
             payload = json.loads(response.read().decode("utf-8", "replace"))
     except Exception:
@@ -160,7 +170,11 @@ def _ws_text_frame(payload: str) -> bytes:
     return bytes(header)
 
 
-def _send_cdp_browser_close(websocket_url: str) -> bool:
+def _send_cdp_browser_close(
+    websocket_url: str,
+    *,
+    timeout_s: float = _DEFAULT_CDP_TIMEOUT_S,
+) -> bool:
     """Send ``Browser.close`` over CDP; True once the command is on the wire.
 
     Deliberately a minimal RFC 6455 client on the standard library: this module
@@ -185,9 +199,10 @@ def _send_cdp_browser_close(websocket_url: str) -> bool:
         f"Sec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode('ascii')}\r\n"
         "Sec-WebSocket-Version: 13\r\n\r\n"
     )
+    timeout = max(0.25, float(timeout_s))
     try:
-        with socket.create_connection((host, port), timeout=5) as connection:
-            connection.settimeout(5)
+        with socket.create_connection((host, port), timeout=timeout) as connection:
+            connection.settimeout(timeout)
             connection.sendall(handshake.encode("ascii"))
             header = b""
             while b"\r\n\r\n" not in header:
@@ -205,7 +220,12 @@ def _send_cdp_browser_close(websocket_url: str) -> bool:
         return False
 
 
-def _request_graceful_exit(port: int, log_path: str | Path | None = None) -> bool:
+def _request_graceful_exit(
+    port: int,
+    log_path: str | Path | None = None,
+    *,
+    cdp_timeout_s: float = _DEFAULT_CDP_TIMEOUT_S,
+) -> bool:
     """Ask the managed Edge to shut itself down, instead of killing it.
 
     Chromium only persists its profile on a clean exit. A forced kill leaves
@@ -219,24 +239,30 @@ def _request_graceful_exit(port: int, log_path: str | Path | None = None) -> boo
     listener PID never reaches the window and the browser survives it.
     """
 
-    websocket_url = _browser_websocket_url(port)
+    websocket_url = _browser_websocket_url(port, timeout_s=cdp_timeout_s)
     if not websocket_url:
         _log(log_path, f"browser gate could not resolve CDP endpoint on port {port}")
         return False
-    if not _send_cdp_browser_close(websocket_url):
+    if not _send_cdp_browser_close(websocket_url, timeout_s=cdp_timeout_s):
         _log(log_path, f"browser gate could not send Browser.close on port {port}")
         return False
     _log(log_path, f"browser gate requested graceful Edge exit on cdp_port={port}")
     return True
 
 
-def _wait_listener_closed(port: int, deadline_s: float) -> bool:
+def _wait_listener_closed(
+    port: int,
+    deadline_s: float,
+    *,
+    command_timeout_s: float = _DEFAULT_COMMAND_TIMEOUT_S,
+) -> bool:
     deadline = time.monotonic() + max(0.0, float(deadline_s))
     while time.monotonic() < deadline:
-        if listener_pid(port) <= 0:
+        remaining = max(0.5, deadline - time.monotonic())
+        if listener_pid(port, command_timeout_s=min(float(command_timeout_s), remaining)) <= 0:
             return True
         time.sleep(0.15)
-    return listener_pid(port) <= 0
+    return listener_pid(port, command_timeout_s=min(float(command_timeout_s), 0.75)) <= 0
 
 
 def close_managed_browser(
@@ -244,6 +270,8 @@ def close_managed_browser(
     port: int = DEFAULT_CDP_PORT,
     deadline_s: float = 6.0,
     graceful_deadline_s: float = 8.0,
+    command_timeout_s: float = _DEFAULT_COMMAND_TIMEOUT_S,
+    cdp_timeout_s: float = _DEFAULT_CDP_TIMEOUT_S,
     log_path: str | Path | None = None,
     progress: ProgressCallback | None = None,
 ) -> BrowserCloseResult:
@@ -259,12 +287,12 @@ def close_managed_browser(
     budget expires, so a hung browser can never block an update.
     """
 
-    pid = listener_pid(port)
+    pid = listener_pid(port, command_timeout_s=command_timeout_s)
     if pid <= 0:
         _log(log_path, f"browser gate: no managed Edge listener on CDP {port}")
         return BrowserCloseResult(True)
 
-    image = _pid_image_name(pid)
+    image = _pid_image_name(pid, command_timeout_s=command_timeout_s)
     if image != OWNED_BROWSER_IMAGE:
         detail = (
             f"CDP port {port} is owned by unexpected process "
@@ -281,7 +309,15 @@ def close_managed_browser(
     _log(log_path, f"browser gate closing managed Edge pid={pid} cdp_port={port}")
     # A refused Browser.close means the endpoint is already unusable, so waiting
     # out the graceful budget would only delay the update it cannot influence.
-    if _request_graceful_exit(port, log_path) and _wait_listener_closed(port, graceful_deadline_s):
+    if _request_graceful_exit(
+        port,
+        log_path,
+        cdp_timeout_s=cdp_timeout_s,
+    ) and _wait_listener_closed(
+        port,
+        graceful_deadline_s,
+        command_timeout_s=command_timeout_s,
+    ):
         _log(
             log_path,
             f"browser gate closed managed Edge pid={pid} gracefully cdp_port={port}",
@@ -298,7 +334,7 @@ def close_managed_browser(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=15,
+            timeout=max(0.5, float(command_timeout_s)),
             creationflags=_CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -306,11 +342,15 @@ def close_managed_browser(
         _log(log_path, f"browser gate failed: {detail}")
         return BrowserCloseResult(False, detail, pid)
 
-    if probe.returncode != 0 and listener_pid(port) > 0:
+    if probe.returncode != 0 and listener_pid(port, command_timeout_s=command_timeout_s) > 0:
         detail = f"taskkill failed for managed Edge pid={pid} exit={probe.returncode}"
         _log(log_path, f"browser gate failed: {detail}")
         return BrowserCloseResult(False, detail, pid)
-    if not _wait_listener_closed(port, deadline_s):
+    if not _wait_listener_closed(
+        port,
+        deadline_s,
+        command_timeout_s=command_timeout_s,
+    ):
         detail = f"managed Edge CDP port {port} remained open after termination"
         _log(log_path, f"browser gate failed: {detail}")
         return BrowserCloseResult(False, detail, pid)
@@ -319,10 +359,34 @@ def close_managed_browser(
     return BrowserCloseResult(True, pid=pid)
 
 
+def prepare_for_velopack_transition(
+    *,
+    port: int = DEFAULT_CDP_PORT,
+    log_path: str | Path | None = None,
+) -> BrowserCloseResult:
+    """Fast, headless cleanup for Velopack install/update/uninstall hooks.
+
+    Velopack itself owns processes whose executable lives under the installation
+    root. The external process it cannot infer from that path is Listing Studio's
+    dedicated Edge tree. Close that exact tree here before package files are
+    replaced while keeping the hook well inside Velopack's fast lifecycle budget.
+    """
+
+    return close_managed_browser(
+        port=port,
+        deadline_s=_VELOPACK_HOOK_CLOSE_DEADLINE_S,
+        graceful_deadline_s=_VELOPACK_HOOK_GRACEFUL_DEADLINE_S,
+        command_timeout_s=_VELOPACK_HOOK_COMMAND_TIMEOUT_S,
+        cdp_timeout_s=_VELOPACK_HOOK_CDP_TIMEOUT_S,
+        log_path=log_path,
+    )
+
+
 __all__ = [
     "BrowserCloseResult",
     "DEFAULT_CDP_PORT",
     "OWNED_BROWSER_IMAGE",
     "close_managed_browser",
     "listener_pid",
+    "prepare_for_velopack_transition",
 ]
