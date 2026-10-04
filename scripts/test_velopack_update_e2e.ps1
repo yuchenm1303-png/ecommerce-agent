@@ -99,13 +99,24 @@ $Setup = Get-SingleVelopackArtifact -Directory $FeedDir -Filter "$PackId*-Setup.
 $Install = Start-Process -FilePath $Setup.FullName -ArgumentList @("--silent", "--installto", $InstallDir) -Wait -PassThru
 if ($Install.ExitCode -ne 0) { throw "Velopack E2E old install failed: $($Install.ExitCode)" }
 
-$RootGui = Join-Path $InstallDir "EcommerceAgent.exe"
 $UpdateExe = Join-Path $InstallDir "Update.exe"
 $CurrentGui = Join-Path $InstallDir "current\EcommerceAgent.exe"
+$SqVersion = Join-Path $InstallDir "current\sq.version"
 $InstalledVersionFile = Join-Path $InstallDir "current\_internal\packaging\VERSION"
-foreach ($Required in @($RootGui, $UpdateExe, $CurrentGui, $InstalledVersionFile)) {
-    if (-not (Test-Path $Required)) { throw "Velopack E2E installed component missing: $Required" }
+foreach ($Required in @($UpdateExe, $CurrentGui, $SqVersion, $InstalledVersionFile)) {
+    if (-not (Test-Path $Required -PathType Leaf)) { throw "Velopack E2E installed component missing: $Required" }
 }
+
+# The root execution stub is named from Velopack packaging metadata and is not
+# guaranteed to equal --mainExe. Discover it rather than hard-coding a stale
+# filename contract, but still exercise it because that is the user launch path.
+$RootLaunchers = @(Get-ChildItem $InstallDir -File -Filter "*.exe" | Where-Object { $_.Name -ne "Update.exe" })
+if ($RootLaunchers.Count -ne 1) {
+    $Names = if ($RootLaunchers.Count -eq 0) { "<none>" } else { ($RootLaunchers.Name -join ", ") }
+    throw "Velopack E2E expected exactly one root execution stub, found $($RootLaunchers.Count): $Names"
+}
+$RootLauncher = $RootLaunchers[0].FullName
+
 $InstalledOldVersion = (Get-Content $InstalledVersionFile -Raw).Trim()
 if ($InstalledOldVersion -ne $OldVersion) {
     throw "Velopack E2E old install VERSION mismatch: expected=$OldVersion actual=$InstalledOldVersion"
@@ -121,8 +132,8 @@ $TargetPackage = Resolve-E2EFullPackage `
     -PackageId $PackId `
     -PackageVersion $Version
 
-Write-Host "  [E2E 3/5] Launch installed old app and let Velopack update + restart it"
-$Process = Start-Process -FilePath $RootGui -ArgumentList @(
+Write-Host "  [E2E 3/5] Launch installed old app through the Velopack root stub and let it update + restart"
+$Process = Start-Process -FilePath $RootLauncher -ArgumentList @(
     "--velopack-e2e-source", $FeedDir,
     "--velopack-e2e-target", $Version,
     "--velopack-e2e-marker", $Marker
@@ -144,7 +155,7 @@ if (-not [bool]$Result.started -or -not [bool]$Result.frozen) {
 if ([string]$Result.version -ne $Version) {
     throw "Velopack E2E version mismatch: expected=$Version actual=$($Result.version)"
 }
-$ExpectedExe = [IO.Path]::GetFullPath((Join-Path $InstallDir "current\EcommerceAgent.exe"))
+$ExpectedExe = [IO.Path]::GetFullPath($CurrentGui)
 $ActualExe = [IO.Path]::GetFullPath([string]$Result.executable)
 if ($ActualExe -ne $ExpectedExe) {
     throw "Velopack E2E relaunched wrong executable: expected=$ExpectedExe actual=$ActualExe"
@@ -154,6 +165,9 @@ if (-not (Test-Path $VersionFile)) { throw "Updated VERSION file missing" }
 $Embedded = (Get-Content $VersionFile -Raw).Trim()
 if ($Embedded -ne $Version) {
     throw "Updated embedded VERSION mismatch: expected=$Version actual=$Embedded"
+}
+if (-not (Test-Path $SqVersion -PathType Leaf)) {
+    throw "Updated Velopack manifest missing: $SqVersion"
 }
 
 Write-Host "  [E2E 5/5] Uninstall the updated Velopack application"
