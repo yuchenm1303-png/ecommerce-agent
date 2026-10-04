@@ -12,6 +12,7 @@ TOP_LEVEL_REQUIREMENTS = (ROOT / "requirements.txt").read_text(encoding="utf-8")
 LOCK = (ROOT / "requirements-release.lock").read_text(encoding="utf-8")
 INSTALL = (ROOT / "scripts" / "install_release_environment.ps1").read_text(encoding="utf-8")
 DOTNET_CONTRACT = json.loads((ROOT / "global.json").read_text(encoding="utf-8"))
+VPK_CONTRACT = json.loads((ROOT / ".config" / "dotnet-tools.json").read_text(encoding="utf-8"))
 
 
 def _require_in_both(fragment: str) -> None:
@@ -111,9 +112,16 @@ def test_release_lock_is_exact_and_covers_packaged_top_level_dependencies() -> N
         "PySide6==6.11.2",
         "PyInstaller==6.22.2",
         "pypinyin==0.55.0",
-        "velopack==1.2.161",
     ):
         assert expected in requirements
+
+    # The dotnet tool manifest is the single Velopack version pin. Python's
+    # runtime package and the frozen release lock must follow it instead of
+    # duplicating another literal version that can silently go stale.
+    vpk_version = str(VPK_CONTRACT["tools"]["vpk"]["version"])
+    assert vpk_version
+    assert f"velopack=={vpk_version}" in TOP_LEVEL_REQUIREMENTS.splitlines()
+    assert f"velopack=={vpk_version}" in requirements
 
 
 def test_release_environment_isolated_and_records_provenance() -> None:
