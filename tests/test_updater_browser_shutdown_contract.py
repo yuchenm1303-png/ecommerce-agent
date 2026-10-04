@@ -39,8 +39,8 @@ def test_managed_browser_gate_closes_exact_msedge_cdp_owner_gracefully(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(gate, "listener_pid", lambda _port: 4242)
-    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid: "msedge.exe")
+    monkeypatch.setattr(gate, "listener_pid", lambda _port, **_k: 4242)
+    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid, **_k: "msedge.exe")
     graceful_ports: list[int] = []
     monkeypatch.setattr(
         gate,
@@ -56,7 +56,6 @@ def test_managed_browser_gate_closes_exact_msedge_cdp_owner_gracefully(
 
     assert result.ok is True
     assert graceful_ports == [9222]
-    # Graceful shutdown only: no taskkill at all, so Chromium persists session cookies.
     assert commands == []
     text = log_path.read_text(encoding="utf-8")
     assert "browser gate closed managed Edge pid=4242 gracefully" in text
@@ -66,10 +65,9 @@ def test_managed_browser_gate_forces_shutdown_after_graceful_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(gate, "listener_pid", lambda _port: 4242)
-    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid: "msedge.exe")
+    monkeypatch.setattr(gate, "listener_pid", lambda _port, **_k: 4242)
+    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid, **_k: "msedge.exe")
     monkeypatch.setattr(gate, "_request_graceful_exit", lambda *_a, **_k: True)
-    # Graceful wait expires first, then the forced kill is confirmed closed.
     waits = [False, True]
     monkeypatch.setattr(gate, "_wait_listener_closed", lambda *_a, **_k: waits.pop(0))
     commands: list[list[str]] = []
@@ -87,14 +85,14 @@ def test_managed_browser_gate_skips_graceful_wait_when_cdp_is_unreachable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(gate, "listener_pid", lambda _port: 4242)
-    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid: "msedge.exe")
+    monkeypatch.setattr(gate, "listener_pid", lambda _port, **_k: 4242)
+    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid, **_k: "msedge.exe")
     monkeypatch.setattr(gate, "_request_graceful_exit", lambda *_a, **_k: False)
     waited: list[float] = []
     monkeypatch.setattr(
         gate,
         "_wait_listener_closed",
-        lambda _port, budget: waited.append(budget) or True,
+        lambda _port, budget, **_k: waited.append(budget) or True,
     )
     commands: list[list[str]] = []
     monkeypatch.setattr(gate.subprocess, "run", _spy_run(commands))
@@ -107,7 +105,6 @@ def test_managed_browser_gate_skips_graceful_wait_when_cdp_is_unreachable(
     )
 
     assert result.ok is True
-    # Only the post-kill confirmation wait ran; the 8s graceful budget was skipped.
     assert waited == [6.0]
     assert commands == [["taskkill", "/PID", "4242", "/T", "/F"]]
 
@@ -153,8 +150,8 @@ def test_cdp_browser_close_sends_a_masked_close_frame_on_the_wire() -> None:
     assert "Sec-WebSocket-Version: 13\r\n" in handshake
 
     frame = received["frame"]
-    assert frame[0] == 0x81  # FIN + text opcode
-    assert frame[1] & 0x80  # client frames must be masked
+    assert frame[0] == 0x81
+    assert frame[1] & 0x80
     length = frame[1] & 0x7F
     assert length < 126
     mask = frame[2 : 2 + 4]
@@ -187,7 +184,7 @@ def test_cdp_browser_close_refuses_a_non_upgrade_answer() -> None:
 
 def test_browser_websocket_url_reads_the_cdp_version_endpoint() -> None:
     class _VersionHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        def do_GET(self) -> None:
             if self.path != "/json/version":
                 self.send_error(404)
                 return
@@ -208,10 +205,7 @@ def test_browser_websocket_url_reads_the_cdp_version_endpoint() -> None:
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     try:
-        assert (
-            gate._browser_websocket_url(port)
-            == "ws://127.0.0.1:9/devtools/browser/fake"
-        )
+        assert gate._browser_websocket_url(port) == "ws://127.0.0.1:9/devtools/browser/fake"
     finally:
         server.shutdown()
         server.server_close()
@@ -221,14 +215,50 @@ def test_browser_websocket_url_reads_the_cdp_version_endpoint() -> None:
 
 
 def test_browser_gate_fails_closed_for_unexpected_port_owner(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gate, "listener_pid", lambda _port: 5151)
-    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid: "python.exe")
+    monkeypatch.setattr(gate, "listener_pid", lambda _port, **_k: 5151)
+    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid, **_k: "python.exe")
     commands: list[list[str]] = []
     monkeypatch.setattr(gate.subprocess, "run", lambda command, **k: commands.append(list(command)) or _Proc())
     result = gate.close_managed_browser(port=9222)
     assert result.ok is False
     assert "unexpected process" in result.detail
     assert commands == []
+
+
+def test_velopack_transition_uses_bounded_headless_browser_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def _close(**kwargs):
+        calls.append(dict(kwargs))
+        return gate.BrowserCloseResult(True, pid=4242)
+
+    monkeypatch.setattr(gate, "close_managed_browser", _close)
+    log_path = tmp_path / "velopack-transition.log"
+    result = gate.prepare_for_velopack_transition(port=9222, log_path=log_path)
+    assert result.ok is True
+    assert calls == [
+        {
+            "port": 9222,
+            "deadline_s": gate._VELOPACK_HOOK_CLOSE_DEADLINE_S,
+            "graceful_deadline_s": 0.0,
+            "command_timeout_s": gate._VELOPACK_HOOK_COMMAND_TIMEOUT_S,
+            "log_path": log_path,
+        }
+    ]
+    assert gate._VELOPACK_HOOK_CLOSE_DEADLINE_S < 15
+    assert gate._VELOPACK_HOOK_COMMAND_TIMEOUT_S < 15
+
+
+def test_manual_setup_and_uninstall_register_fast_cleanup_before_velopack_run() -> None:
+    hook = Path("packaging/velopack_runtime_hook.py").read_text(encoding="utf-8")
+    assert "prepare_for_velopack_transition" in hook
+    assert "on_before_update_fast_callback(_prepare_for_transition)" in hook
+    assert "on_before_uninstall_fast_callback(_prepare_for_transition)" in hook
+    assert hook.index("on_before_update_fast_callback") < hook.index("_velopack_app.run()")
+    assert hook.index("on_before_uninstall_fast_callback") < hook.index("_velopack_app.run()")
 
 
 def test_velopack_update_quiesces_business_browser_before_framework_handoff() -> None:
