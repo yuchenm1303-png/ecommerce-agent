@@ -84,10 +84,13 @@ jobs:
           dotnet tool run vpk -- --help *> $null
           if ($LASTEXITCODE -ne 0) { throw "Pinned Velopack CLI failed to start: $LASTEXITCODE" }
 
-      - name: Verify Windows installer and lifecycle contracts
+      - name: Verify Windows installer and release contracts before heavy build
         shell: pwsh
         run: |
           python -m pytest -q `
+            tests/test_release_parity_contract.py `
+            tests/test_windows_packaging_contract.py `
+            tests/test_customer_installer_contract.py `
             tests/test_velopack_lifecycle_api.py `
             tests/test_velopack_update_contract.py `
             tests/test_updater_browser_shutdown_contract.py
@@ -155,9 +158,10 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Start legacy mock seller site
-        run: |
-          python -m http.server 8000 --directory mock_site >/tmp/mock-site.log 2>&1 &
-          sleep 1
+        run: python -m http.server 8000 --directory mock_site >/tmp/mock-site.log 2>&1 &
+
+      - name: Wait for legacy mock seller site
+        run: sleep 1
 
       - name: Run legacy browser automation dry-run
         run: python main.py --headless --dry-run
