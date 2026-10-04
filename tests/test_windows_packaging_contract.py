@@ -214,6 +214,15 @@ def test_build_discovers_native_assets_and_never_guesses_velopack_package_names(
     assert '"$PackId-$Version-full.nupkg"' not in BUILD
 
 
+def test_build_verifies_hydrated_release_instead_of_trusting_vpk_exit_code() -> None:
+    assert "function Test-VelopackHydratedRelease" in BUILD
+    assert '$PreviousReleaseIndex = Join-Path $VelopackDir "releases.$Channel.json"' in BUILD
+    assert "$PreviousReleaseExitCode -eq 0 -and" in BUILD
+    assert "(Test-VelopackHydratedRelease" in BUILD
+    assert "$PreviousReleaseDownloaded = ($PreviousReleaseExitCode -eq 0)" not in BUILD
+    assert "download returned success but produced no usable previous Full release" in BUILD
+
+
 def test_build_validates_feed_binding_and_has_production_signing_hooks() -> None:
     assert "$Feed.Assets" in BUILD
     assert '"Full"' in BUILD
