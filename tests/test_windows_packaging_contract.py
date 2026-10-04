@@ -127,7 +127,7 @@ def test_worker_freeze_contract_reconciles_complete_makro_runtime_into_pyz() -> 
 
 def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
     manifest = json.loads((ROOT / ".config" / "dotnet-tools.json").read_text(encoding="utf-8"))
-    assert manifest["tools"]["vpk"]["version"] == "1.2.0"
+    assert manifest["tools"]["vpk"]["version"] == "1.2.161"
     assert "dotnet tool restore" in BUILD
     assert '. (Join-Path $PSScriptRoot "velopack_cli.ps1")' in BUILD
     assert "Invoke-RepositoryVelopack" in BUILD
