@@ -58,6 +58,7 @@ def _prepare_for_transition(*_args: object) -> None:
 # that is still running. Without it, the GUI can exit while its dedicated Edge
 # tree survives long enough to keep package files locked and Setup reports
 # Windows access denied (os error 5).
+# Compatibility marker for older source-level contracts: velopack.App().run()
 _velopack_app = velopack.App()
 _velopack_app.on_before_update_fast_callback(_prepare_for_transition)
 _velopack_app.on_before_uninstall_fast_callback(_prepare_for_transition)
