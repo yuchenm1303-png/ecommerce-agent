@@ -151,11 +151,17 @@ jobs:
             "--silent", "--installto", $installDir
           ) -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Velopack install failed: $($process.ExitCode)" }
-          $stub = Join-Path $installDir "EcommerceAgent.exe"
+          $gui = Join-Path $installDir "current\EcommerceAgent.exe"
+          $sqVersion = Join-Path $installDir "current\sq.version"
           $worker = Join-Path $installDir "current\EcommerceAgentWorker.exe"
           $versionFile = Join-Path $installDir "current\_internal\packaging\VERSION"
-          foreach ($required in @($stub, $worker, $versionFile, (Join-Path $installDir "Update.exe"))) {
-            if (-not (Test-Path $required)) { throw "Installed component missing: $required" }
+          $update = Join-Path $installDir "Update.exe"
+          foreach ($required in @($update, $gui, $sqVersion, $worker, $versionFile)) {
+            if (-not (Test-Path $required -PathType Leaf)) { throw "Installed component missing: $required" }
+          }
+          $rootLaunchers = @(Get-ChildItem $installDir -File -Filter "*.exe" | Where-Object { $_.Name -ne "Update.exe" })
+          if ($rootLaunchers.Count -ne 1) {
+            throw "Expected exactly one Velopack root execution stub, found $($rootLaunchers.Count): $($rootLaunchers.Name -join ', ')"
           }
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
