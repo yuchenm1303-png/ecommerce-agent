@@ -16,6 +16,7 @@ from playwright.sync_api import Page
 from ..makro_dryrun import FillVerification, fill_resolved_field, verify_resolved_field
 from .field_engine import execution_contract, fill_control as fill_live_control
 from .fields import build_semantic_fields, scroll_and_capture
+from .image_requirements import inspect_listing_image, listing_image_cms_error
 from .listing import (
     MakroListingTarget,
     assert_expected_vertical,
@@ -245,11 +246,75 @@ class MakroDomainAdapter:
         *,
         timeout_ms: int = 30_000,
     ) -> PhotoUploadResult:
-        return upload_product_photos(
+        eligible_paths: list[Path] = []
+        quality_rejections: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for raw in image_paths:
+            path = Path(raw).expanduser().resolve()
+            key = str(path).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if not path.is_file():
+                # Preserve the existing uploader's canonical missing-file handling.
+                eligible_paths.append(path)
+                continue
+
+            try:
+                inspection = inspect_listing_image(path)
+                error = listing_image_cms_error(inspection)
+            except ValueError as exc:
+                inspection = None
+                error = str(exc)
+
+            if error:
+                payload: dict[str, Any] = {
+                    "path": str(path),
+                    "status": "rejected_pre_submit",
+                    "detail": f"Makro CMS 图片预检拒绝：{error}",
+                    "failure_scope": "image",
+                    "validation": "makro_cms_image_requirements",
+                }
+                if inspection is not None:
+                    payload["inspection"] = inspection.as_dict()
+                quality_rejections.append(payload)
+                print(
+                    f"GUI_EXEC_PHOTO\tCMS_REJECTED\t{path.name}\t{error}",
+                    flush=True,
+                )
+                continue
+
+            assert inspection is not None
+            eligible_paths.append(path)
+            print(
+                f"GUI_EXEC_PHOTO\tCMS_ACCEPTED\t{path.name}\t"
+                f"image={inspection.width}x{inspection.height}\t"
+                f"content={inspection.content_width}x{inspection.content_height}",
+                flush=True,
+            )
+
+        result = upload_product_photos(
             self.page,
-            image_paths,
+            eligible_paths,
             timeout_ms=timeout_ms,
         )
+        if not quality_rejections:
+            return result
+
+        result.items = quality_rejections + list(result.items)
+        rejected_count = len(quality_rejections)
+        if result.status == "skipped":
+            result.status = "no_usable_input"
+            result.detail = (
+                f"{rejected_count} 张请求图片全部未通过 Makro CMS 上传前图片校验；"
+                "没有改变任何图片槽。"
+            )
+        else:
+            prefix = f"Makro CMS 上传前校验隔离 {rejected_count} 张不合格图片。"
+            result.detail = f"{prefix} {result.detail}".strip()
+        return result
 
     def verify_persisted_photo_count(
         self,
