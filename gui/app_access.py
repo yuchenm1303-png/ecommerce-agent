@@ -626,6 +626,17 @@ class _LoginDialog(QDialog):
                     device_id=device_id,
                     device_name=device_name,
                 )
+                if cancel_event.is_set():
+                    try:
+                        _license_check(
+                            access_token,
+                            action="deactivate",
+                            device_id=device_id,
+                            device_name=device_name,
+                        )
+                    except AccessError:
+                        pass
+                    raise DesktopOAuthError("oauth_cancelled")
                 session = _session_from_auth(
                     auth,
                     licensed,
