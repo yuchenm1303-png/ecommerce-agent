@@ -408,45 +408,63 @@ def _download_with_chunked_fallback(
     source: str | None,
     progress: Callable[[int], None],
 ) -> Any:
-    """Keep normal Velopack transport first, then recover from a mirrored full package.
+    """Use verified chunks first for large full-only updates, Delta first otherwise.
 
-    The chunk path is transport-only: bytes are reassembled and strictly checked,
-    then handed back to an ordinary Velopack local-directory source. Velopack still
-    owns release selection, delta/full semantics, staging and install validation.
+    GitHub and local sources keep Velopack's ordinary transport. A completed
+    mirror is an immutable byte transport, not another release authority:
+    the full file still requires its expected SHA256 and Velopack verifies the
+    resulting local release before staging/installing it.
     """
+    candidate = str(source or "").strip().rstrip("/")
+    is_mirror = candidate.startswith("https://") and candidate != GITHUB_REPOSITORY_URL
+
+    def _download_chunks() -> Any:
+        with materialize_chunked_velopack_source(
+            candidate,
+            info,
+            progress=lambda value: progress(max(0, min(85, int(value) * 85 // 100))),
+        ) as local_source:
+            local_manager = create_update_manager(str(local_source))
+            local_info = local_manager.check_for_updates()
+            if local_info is None:
+                raise RuntimeError("chunked local source did not expose the expected update")
+            expected = str(info.TargetFullRelease.Version or "").strip().lstrip("v")
+            actual = str(local_info.TargetFullRelease.Version or "").strip().lstrip("v")
+            if actual != expected:
+                raise RuntimeError(
+                    f"chunked local source target mismatch: expected={expected} actual={actual}"
+                )
+            local_manager.download_updates(
+                local_info,
+                lambda value: progress(85 + max(0, min(15, int(value) * 15 // 100))),
+            )
+            if local_manager.get_update_pending_restart() is None:
+                raise RuntimeError("chunked Velopack download completed without a pending update")
+            return local_manager
+
+    # A 250 MB full package is much more likely to be interrupted on a slow
+    # cross-border link than an existing small Velopack Delta. Prefer resumable
+    # mirrored chunks ONLY when there are no delta assets to download.
+    chunk_attempted = False
+    if is_mirror and not list(getattr(info, "DeltasToTarget", None) or []):
+        chunk_attempted = True
+        try:
+            return _download_chunks()
+        except ChunkMirrorUnavailable:
+            # The CDN may still be warming a new Stable; use normal Velopack.
+            pass
 
     try:
         manager.download_updates(info, progress)
         return manager
     except Exception as primary_error:
-        candidate = str(source or "").strip().rstrip("/")
-        if not candidate.startswith("https://") or candidate == GITHUB_REPOSITORY_URL:
+        if not is_mirror or chunk_attempted:
             raise
         try:
-            with materialize_chunked_velopack_source(
-                candidate,
-                info,
-                progress=lambda value: progress(max(0, min(85, int(value) * 85 // 100))),
-            ) as local_source:
-                local_manager = create_update_manager(str(local_source))
-                local_info = local_manager.check_for_updates()
-                if local_info is None:
-                    raise RuntimeError("chunked local source did not expose the expected update")
-                expected = str(info.TargetFullRelease.Version or "").strip().lstrip("v")
-                actual = str(local_info.TargetFullRelease.Version or "").strip().lstrip("v")
-                if actual != expected:
-                    raise RuntimeError(
-                        f"chunked local source target mismatch: expected={expected} actual={actual}"
-                    )
-                local_manager.download_updates(
-                    local_info,
-                    lambda value: progress(85 + max(0, min(15, int(value) * 15 // 100))),
-                )
-                if local_manager.get_update_pending_restart() is None:
-                    raise RuntimeError("chunked Velopack download completed without a pending update")
-                return local_manager
+            return _download_chunks()
         except ChunkMirrorUnavailable:
             raise primary_error
+
 
 
 def _run_download_worker() -> int:
