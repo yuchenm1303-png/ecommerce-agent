@@ -246,7 +246,7 @@ def _request_json(
             parsed = json.loads(raw) if raw else {}
         except (UnicodeDecodeError, json.JSONDecodeError):
             parsed = {}
-        code = str(parsed.get("error") or parsed.get("error_code") or "request_failed")
+        code = str(parsed.get("error_code") or parsed.get("code") or parsed.get("error") or "request_failed")
         raise AccessError(code, status=int(exc.code or 0)) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise AccessNetworkError("network_unavailable") from exc
@@ -442,6 +442,7 @@ def _friendly_error(error: AccessError) -> str:
         "invalid_auth": "登录状态无效，请重新登录。",
         "not_authorized": "该账号尚未获得 Listing Studio 使用权限。",
         "account_banned": "该账号已被管理员封禁，请联系管理员处理。",
+        "user_banned": "该账号已被管理员封禁，请联系管理员处理。",
         "access_expired": "该账号的 Listing Studio 授权已过期。",
         "device_limit_reached": "当前账号已达到设备授权数量上限。",
         "device_revoked": "这台设备的授权已被管理员撤销。",
