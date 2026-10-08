@@ -80,7 +80,7 @@ def test_manual_update_check_adopts_an_inflight_startup_check_instead_of_silentl
 def test_stable_build_hydrates_previous_release_and_requires_a_delta() -> None:
     assert '"download", "github"' in BUILD
     assert '"--repoUrl", "https://github.com/yuchenm1303-png/ecommerce-agent"' in BUILD
-    assert '--channel $Channel' in BUILD
+    assert '"--channel", $Channel' in BUILD
     assert '"--outputDir", $VelopackDir' in BUILD
     assert '"--delta", "BestSize"' in BUILD
     assert 'Resolve-VelopackDeltaPackage' in BUILD
