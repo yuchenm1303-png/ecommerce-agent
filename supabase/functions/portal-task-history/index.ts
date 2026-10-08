@@ -112,10 +112,11 @@ async function resolveViewerScope(
 ): Promise<ViewerScope> {
   const { data: access, error: accessError } = await admin
     .from("download_portal_users")
-    .select("enabled,is_admin")
+    .select("enabled,is_admin,banned_at")
     .eq("user_id", userId)
     .maybeSingle();
   if (accessError) throw new Error("access_check_failed");
+  if (access?.banned_at) throw new Error("not_authorized");
   if (access?.enabled && access?.is_admin) {
     return { mode: "owner", userIds: [], tenantId: "", tenantName: "", tenantSlug: "" };
   }
