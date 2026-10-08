@@ -136,6 +136,7 @@ def test_desktop_login_dialog_keeps_existing_license_gate() -> None:
     source = Path("gui/app_access.py").read_text(encoding="utf-8")
     assert "run_social_oauth(" in source
     assert 'action="activate"' in source
+    assert 'action="deactivate"' in source
     assert "_license_check(" in source
     assert "_save_state(session)" in source
     assert "使用 Google 继续" in source
