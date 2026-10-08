@@ -443,8 +443,10 @@ def _restore_session() -> ApplicationAccessSession | None:
         if session.grace_until > time.time():
             return session
         return None
-    except AccessError:
-        _clear_state()
+    except AccessError as exc:
+        # An unwritable cache is not evidence that a license or account was revoked.
+        if exc.code != "session_persist_failed":
+            _clear_state()
         return None
 
 
