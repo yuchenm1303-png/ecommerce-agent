@@ -147,8 +147,8 @@ def _dpapi_unprotect(data: bytes) -> bytes:
 
 
 def _load_state() -> dict[str, Any]:
-    path = _local_state_path()
     try:
+        path = _local_state_path()
         raw = _dpapi_unprotect(path.read_bytes())
         payload = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
@@ -173,10 +173,13 @@ def _save_state(session: ApplicationAccessSession) -> None:
         "display_name": session.display_name,
     }
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    path = _local_state_path()
-    temp = path.with_suffix(".tmp")
-    temp.write_bytes(_dpapi_protect(encoded))
-    temp.replace(path)
+    try:
+        path = _local_state_path()
+        temp = path.with_suffix(".tmp")
+        temp.write_bytes(_dpapi_protect(encoded))
+        temp.replace(path)
+    except (OSError, ValueError) as exc:
+        raise AccessError("session_persist_failed") from exc
 
 
 def _clear_state() -> None:
@@ -249,7 +252,11 @@ def _request_json(
         except (UnicodeDecodeError, json.JSONDecodeError):
             parsed = {}
         code = str(parsed.get("error") or parsed.get("error_code") or "request_failed")
-        raise AccessError(code, status=int(exc.code or 0)) from exc
+        status = int(exc.code or 0)
+        # Rate limits and server-side errors must not erase a valid local login.
+        if status == 429 or status >= 500:
+            raise AccessNetworkError("service_unavailable", status=status) from exc
+        raise AccessError(code, status=status) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise AccessNetworkError("network_unavailable") from exc
 
@@ -280,6 +287,35 @@ def _license_check(
         },
         access_token=access_token,
     )
+
+
+def _complete_sign_in(
+    auth: dict[str, Any],
+    *,
+    action: str = "validate",
+) -> ApplicationAccessSession:
+    """Authorize an existing device first; activate only on explicit confirmation."""
+    if action not in {"validate", "activate"}:
+        raise ValueError("invalid_device_action")
+    access_token = str(auth.get("access_token") or "")
+    refresh_token = str(auth.get("refresh_token") or "")
+    if not access_token or not refresh_token:
+        raise AccessError("invalid_auth")
+    device_id, device_name = device_identity()
+    licensed = _license_check(
+        access_token,
+        action=action,
+        device_id=device_id,
+        device_name=device_name,
+    )
+    session = _session_from_auth(
+        auth,
+        licensed,
+        device_id=device_id,
+        device_name=device_name,
+    )
+    _save_state(session)
+    return session
 
 
 def _session_from_auth(
@@ -452,6 +488,9 @@ def _friendly_error(error: AccessError) -> str:
         "invalid_credentials": "邮箱或密码错误。",
         "email_not_confirmed": "邮箱尚未完成验证。",
         "invalid_auth": "登录状态无效，请重新登录。",
+        "invalid_grant": "登录凭据已过期，请重新登录。",
+        "session_persist_failed": "无法保存登录状态，请检查 Windows 用户目录的写入权限及剩余空间。",
+        "service_unavailable": "授权服务暂时繁忙，原有登录记录已保留，请稍后重试。",
         "not_authorized": "该账号尚未获得 Listing Studio 使用权限。",
         "access_expired": "该账号的 Listing Studio 授权已过期。",
         "device_limit_reached": "当前账号已达到设备授权数量上限。",
@@ -478,7 +517,7 @@ class _LoginDialog(QDialog):
 
         title = QLabel("Listing Studio")
         title.setObjectName("accessTitle")
-        subtitle = QLabel("登录已授权账号后才能使用正式安装版。")
+        subtitle = QLabel("登录后自动识别已有设备授权，只有新设备才需要确认激活。")
         subtitle.setWordWrap(True)
         subtitle.setObjectName("accessSubtitle")
 
@@ -524,16 +563,19 @@ class _LoginDialog(QDialog):
         form.addRow("邮箱", self.email)
         form.addRow("密码", self.password)
 
-        self.status = QLabel("账号权限与设备授权会同时验证。")
+        self.status = QLabel("已激活的设备重新登录，不会重复占用设备名额。")
         self.status.setWordWrap(True)
         self.status.setObjectName("accessStatus")
 
-        self.login_button = QPushButton("登录并激活此设备")
+        self._pending_activation_auth: dict[str, Any] | None = None
+        self.login_button = QPushButton("登录")
         self.login_button.setDefault(True)
         self.cancel_button = QPushButton("退出")
         self.login_button.clicked.connect(self._login)
         self.cancel_button.clicked.connect(self.reject)
         self.password.returnPressed.connect(self._login)
+        self.email.textEdited.connect(self._reset_pending_activation)
+        self.password.textEdited.connect(self._reset_pending_activation)
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.cancel_button)
@@ -572,6 +614,48 @@ class _LoginDialog(QDialog):
         previous = _load_state()
         if previous.get("email"):
             self.email.setText(str(previous["email"]))
+
+    def _reset_pending_activation(self, *_: Any) -> None:
+        if self._pending_activation_auth is None:
+            return
+        self._pending_activation_auth = None
+        self.login_button.setText("登录")
+        self.status.setText("已更改登录信息，请重新登录并验证设备授权。")
+
+    def _prepare_activation(self, auth: dict[str, Any]) -> None:
+        # A missing device binding is the ONLY condition enabling this action.
+        user = auth.get("user") if isinstance(auth.get("user"), dict) else {}
+        email = str(user.get("email") or self.email.text().strip())
+        if email:
+            self.email.setText(email)
+        self._pending_activation_auth = auth
+        self.login_button.setText("确认激活此设备")
+        self.status.setText(
+            "此账号尚未在这台电脑激活。确认激活将占用一个设备授权名额；"
+            "已绑定的其他设备不会受到影响。"
+        )
+        self._set_busy(False)
+
+    def _activate_pending_device(self) -> None:
+        auth = self._pending_activation_auth
+        if auth is None:
+            return
+        self._set_busy(True)
+        self.status.setText("正在激活当前设备并保存登录状态…")
+        QApplication.processEvents()
+        try:
+            session = _complete_sign_in(auth, action="activate")
+            self.session = session
+            self._pending_activation_auth = None
+            self.accept()
+        except AccessError as exc:
+            if not isinstance(exc, AccessNetworkError):
+                self._pending_activation_auth = None
+                self.login_button.setText("登录")
+            self.status.setText(_friendly_error(exc))
+        finally:
+            if self.session is None:
+                self._set_busy(False)
 
     def _set_busy(self, busy: bool) -> None:
         self.email.setEnabled(not busy)
@@ -616,39 +700,16 @@ class _LoginDialog(QDialog):
                 if cancel_event.is_set():
                     raise DesktopOAuthError("oauth_cancelled")
 
-                access_token = str(auth.get("access_token") or "")
-                if not access_token:
-                    raise AccessError("invalid_auth")
-                device_id, device_name = device_identity()
-                licensed = _license_check(
-                    access_token,
-                    action="activate",
-                    device_id=device_id,
-                    device_name=device_name,
-                )
-                if cancel_event.is_set():
-                    try:
-                        _license_check(
-                            access_token,
-                            action="deactivate",
-                            device_id=device_id,
-                            device_name=device_name,
-                        )
-                    except AccessError:
-                        pass
-                    raise DesktopOAuthError("oauth_cancelled")
-                session = _session_from_auth(
-                    auth,
-                    licensed,
-                    device_id=device_id,
-                    device_name=device_name,
-                )
-                if not session.refresh_token:
-                    raise AccessError("invalid_auth")
                 if cancel_event.is_set():
                     raise DesktopOAuthError("oauth_cancelled")
-                _save_state(session)
-                outcome["session"] = session
+                try:
+                    session = _complete_sign_in(auth, action="validate")
+                except AccessError as exc:
+                    if exc.code != "device_not_activated":
+                        raise
+                    outcome["pending_auth"] = auth
+                else:
+                    outcome["session"] = session
             except DesktopOAuthError as exc:
                 outcome["error"] = AccessError(exc.code, status=exc.status)
             except AccessError as exc:
@@ -672,6 +733,7 @@ class _LoginDialog(QDialog):
         self._oauth_poll.stop()
 
         session = self._oauth_outcome.get("session")
+        pending_auth = self._oauth_outcome.get("pending_auth")
         error = self._oauth_outcome.get("error")
         self._oauth_finished = None
         self._oauth_cancel_event = None
@@ -682,6 +744,9 @@ class _LoginDialog(QDialog):
             return
 
         self._set_busy(False)
+        if isinstance(pending_auth, dict):
+            self._prepare_activation(pending_auth)
+            return
         if isinstance(error, AccessError):
             self.status.setText(_friendly_error(error))
         else:
@@ -692,6 +757,10 @@ class _LoginDialog(QDialog):
         super().reject()
 
     def _login(self) -> None:
+        if self._pending_activation_auth is not None:
+            self._activate_pending_device()
+            return
+
         email = self.email.text().strip()
         password = self.password.text()
         if not email or not password:
@@ -699,33 +768,20 @@ class _LoginDialog(QDialog):
             return
 
         self._set_busy(True)
-        self.status.setText("正在验证账号与设备权限…")
+        self.status.setText("正在登录并检查已有设备授权…")
         QApplication.processEvents()
 
-        device_id, device_name = device_identity()
         try:
             auth = _auth_password(email, password)
-            access_token = str(auth.get("access_token") or "")
-            if not access_token:
-                raise AccessError("invalid_auth")
-            licensed = _license_check(
-                access_token,
-                action="activate",
-                device_id=device_id,
-                device_name=device_name,
-            )
-            session = _session_from_auth(
-                auth,
-                licensed,
-                device_id=device_id,
-                device_name=device_name,
-            )
-            if not session.refresh_token:
-                raise AccessError("invalid_auth")
-            _save_state(session)
+            try:
+                session = _complete_sign_in(auth, action="validate")
+            except AccessError as exc:
+                if exc.code != "device_not_activated":
+                    raise
+                self._prepare_activation(auth)
+                return
             self.session = session
             self.accept()
-            return
         except AccessError as exc:
             self.status.setText(_friendly_error(exc))
         finally:
