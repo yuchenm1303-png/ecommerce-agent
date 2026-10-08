@@ -28,6 +28,9 @@ on:
         required: true
         default: "稳定性与上架流程优化。"
         type: string
+  push:
+    branches:
+      - release/stable-publish
 
 permissions:
   contents: write
@@ -38,13 +41,14 @@ concurrency:
 
 jobs:
   publish-stable-update:
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[publish-stable]') }}
     runs-on: windows-2025
     timeout-minutes: 75
     env:
-      SOURCE_REF: ${{ inputs.source_ref }}
-      REQUESTED_VERSION: ${{ inputs.version }}
-      UPDATE_TITLE: ${{ inputs.title }}
-      UPDATE_NOTES: ${{ inputs.release_notes }}
+      SOURCE_REF: ${{ inputs.source_ref || 'main' }}
+      REQUESTED_VERSION: ${{ inputs.version || 'auto' }}
+      UPDATE_TITLE: ${{ inputs.title || 'Listing Studio Stable Update' }}
+      UPDATE_NOTES: ${{ inputs.release_notes || 'Google / GitHub 快捷登录与安装链路改进。' }}
       GH_TOKEN: ${{ github.token }}
       VELOPACK_CHANNEL: win-x64-stable
       VPK_AZURE_TRUSTED_SIGN_FILE: ${{ secrets.VPK_AZURE_TRUSTED_SIGN_FILE }}
@@ -54,7 +58,7 @@ jobs:
       - name: Checkout selected source revision
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ inputs.source_ref || 'main' }}
           fetch-depth: 0
 
       - name: Require dispatcher/source workflow parity
@@ -151,7 +155,7 @@ jobs:
           Write-Host "Resolved unique release name: $releaseName"
 
       - name: Verify optional Test candidate
-        if: ${{ inputs.validated_test_tag != '' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.validated_test_tag != '' }}
         shell: pwsh
         run: |
           $tag = ([string]"${{ inputs.validated_test_tag }}").Trim()
