@@ -163,3 +163,117 @@ def test_auth_refresh_remains_non_retried_and_device_validation_is_retryable():
     license = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_license_check")
     assert "retry_transient" not in ast.get_source_segment(source, auth)
     assert 'retry_transient=action == "validate"' in ast.get_source_segment(source, license)
+
+
+def _isolate_chunk_priority_manager(context):
+    import __future__
+    source = (ROOT / "app" / "velopack_runtime.py").read_text(encoding="utf-8")
+    parsed = ast.parse(source)
+    node = next(n for n in parsed.body if isinstance(n, ast.FunctionDef) and n.name == "_download_with_chunked_fallback")
+    unit = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+    namespace = dict(context)
+    exec(
+        compile(unit, "app/velopack_runtime.py", "exec", flags=__future__.annotations.compiler_flag),
+        namespace,
+    )
+    return namespace["_download_with_chunked_fallback"]
+
+
+def test_full_only_mirror_prefers_resumable_chunks_over_large_direct_package(tmp_path):
+    from contextlib import contextmanager
+
+    calls = []
+    info = SimpleNamespace(
+        TargetFullRelease=SimpleNamespace(Version="0.1.67"),
+        DeltasToTarget=[],
+    )
+
+    class Direct:
+        def download_updates(self, *_):
+            calls.append("direct")
+
+    class Local:
+        def check_for_updates(self):
+            calls.append("local-check")
+            return info
+
+        def download_updates(self, *_):
+            calls.append("local-download")
+
+        def get_update_pending_restart(self):
+            return object()
+
+    local = Local()
+
+    @contextmanager
+    def mirrored(*args, **kwargs):
+        calls.append("chunks")
+        yield tmp_path
+
+    fn = _isolate_chunk_priority_manager({
+        "GITHUB_REPOSITORY_URL": "https://github.com/example/repo",
+        "ChunkMirrorUnavailable": type("ChunkMirrorUnavailable", (RuntimeError,), {}),
+        "materialize_chunked_velopack_source": mirrored,
+        "create_update_manager": lambda _: local,
+    })
+    result = fn(Direct(), info, "https://mirror.example/stable/v0.1.67", lambda value: None)
+    assert result is local
+    assert calls == ["chunks", "local-check", "local-download"]
+
+
+def test_small_delta_remains_direct_velopack_first(tmp_path):
+    from contextlib import contextmanager
+
+    calls = []
+    info = SimpleNamespace(
+        TargetFullRelease=SimpleNamespace(Version="0.1.67"),
+        DeltasToTarget=[SimpleNamespace(FileName="patch.nupkg")],
+    )
+
+    class Direct:
+        def download_updates(self, *_):
+            calls.append("direct")
+
+    @contextmanager
+    def mirrored(*args, **kwargs):
+        calls.append("chunks")
+        yield tmp_path
+
+    direct = Direct()
+    fn = _isolate_chunk_priority_manager({
+        "GITHUB_REPOSITORY_URL": "https://github.com/example/repo",
+        "ChunkMirrorUnavailable": type("ChunkMirrorUnavailable", (RuntimeError,), {}),
+        "materialize_chunked_velopack_source": mirrored,
+    })
+    assert fn(direct, info, "https://mirror.example", lambda value: None) is direct
+    assert calls == ["direct"]
+
+
+def test_unavailable_full_mirror_falls_back_to_normal_velopack_transport():
+    from contextlib import contextmanager
+
+    calls = []
+    unavailable = type("ChunkMirrorUnavailable", (RuntimeError,), {})
+    info = SimpleNamespace(
+        TargetFullRelease=SimpleNamespace(Version="0.1.67"),
+        DeltasToTarget=[],
+    )
+
+    class Direct:
+        def download_updates(self, *_):
+            calls.append("direct")
+
+    @contextmanager
+    def mirrored(*args, **kwargs):
+        calls.append("chunks")
+        raise unavailable("not yet mirrored")
+        yield
+
+    fn = _isolate_chunk_priority_manager({
+        "GITHUB_REPOSITORY_URL": "https://github.com/example/repo",
+        "ChunkMirrorUnavailable": unavailable,
+        "materialize_chunked_velopack_source": mirrored,
+    })
+    direct = Direct()
+    assert fn(direct, info, "https://mirror.example", lambda value: None) is direct
+    assert calls == ["chunks", "direct"]
