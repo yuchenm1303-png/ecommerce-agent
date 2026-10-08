@@ -514,14 +514,16 @@ class _LoginDialog(QDialog):
         self.session: ApplicationAccessSession | None = None
         self.setWindowTitle("Listing Studio · Account Access")
         self.setModal(True)
-        self.setFixedWidth(430)
+        self.setFixedWidth(460)
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
 
-        title = QLabel("Listing Studio")
+        title = QLabel("欢迎使用 Listing Studio")
         title.setObjectName("accessTitle")
-        subtitle = QLabel("登录后自动识别已有设备授权，只有新设备才需要确认激活。")
+        subtitle = QLabel("账号登录与设备激活相互独立，已有设备只需重新登录。")
         subtitle.setWordWrap(True)
         subtitle.setObjectName("accessSubtitle")
+        self.step_label = QLabel("01  登录账号     /     自动检查设备授权")
+        self.step_label.setObjectName("accessStep")
 
         self._oauth_cancel_event: threading.Event | None = None
         self._oauth_finished: threading.Event | None = None
@@ -585,10 +587,11 @@ class _LoginDialog(QDialog):
         buttons.addWidget(self.login_button)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 24, 26, 24)
+        layout.setContentsMargins(28, 26, 28, 27)
         layout.setSpacing(14)
         layout.addWidget(title)
         layout.addWidget(subtitle)
+        layout.addWidget(self.step_label)
         layout.addLayout(oauth_buttons)
         layout.addWidget(oauth_separator)
         layout.addLayout(form)
@@ -599,13 +602,19 @@ class _LoginDialog(QDialog):
         self.setStyleSheet(
             """
             QDialog { background: #111923; color: #eef5fb; }
-            QLabel#accessTitle { font-size: 24px; font-weight: 700; }
-            QLabel#accessSubtitle, QLabel#accessStatus { color: #9eb0bf; }
-            QLabel#accessSeparator { color: #718797; font-size: 12px; padding: 1px 0; }
+            QLabel#accessTitle { font-size: 21px; font-weight: 700; color: #f5f9ff; }
+            QLabel#accessSubtitle { color: #a6b7c7; }
+            QLabel#accessStep { color: #a9ccda; font-weight: 600; font-size: 12px;
+                background: #1a2b38; border: 1px solid #314a58;
+                border-radius: 9px; padding: 12px 13px; }
+            QLabel#accessStatus { color: #bdcbd5; background: #182631;
+                border: 1px solid #30424f; border-radius: 9px; padding: 12px; }
+            QLabel#accessSeparator { color: #8196a5; font-size: 12px; padding: 1px 0; }
             QLineEdit { min-height: 36px; padding: 0 10px; border: 1px solid #314150; border-radius: 8px; background: #18232e; color: #f4f8fb; }
             QLineEdit:focus { border-color: #73c8d8; }
             QPushButton { min-height: 36px; padding: 0 16px; border: 1px solid #334858; border-radius: 8px; background: #1c2a36; color: #eaf4fb; }
-            QPushButton:default { background: #2f7282; border-color: #63b8ca; }
+            QPushButton:default { background: #236f83; border-color: #74d3e9; font-weight: 700; }
+            QPushButton:default:hover { background: #2d8498; border-color: #91e2f4; }
             QPushButton#oauthProviderButton { min-height: 40px; background: #20303d; border-color: #3a5263; font-weight: 650; }
             QPushButton#oauthProviderButton:hover { background: #2a3d4b; border-color: #527286; }
             QPushButton:disabled { color: #6f808d; background: #18232e; border-color: #293946; }
@@ -622,6 +631,8 @@ class _LoginDialog(QDialog):
             return
         self._pending_activation_auth = None
         self.login_button.setText("登录")
+        self.step_label.setText("01  登录账号     /     自动检查设备授权")
+        self.status.setStyleSheet("")
         self.status.setText("已更改登录信息，请重新登录并验证设备授权。")
 
     def _prepare_activation(self, auth: dict[str, Any]) -> None:
@@ -631,7 +642,12 @@ class _LoginDialog(QDialog):
         if email:
             self.email.setText(email)
         self._pending_activation_auth = auth
+        self.step_label.setText("02  首次设备激活     /     等待你的确认")
         self.login_button.setText("确认激活此设备")
+        self.status.setStyleSheet(
+            "QLabel#accessStatus { color: #f7dab0; background: #352a21;"
+            "border: 1px solid #88603b; border-radius: 9px; padding: 12px; }"
+        )
         self.status.setText(
             "此账号尚未在这台电脑激活。确认激活将占用一个设备授权名额；"
             "已绑定的其他设备不会受到影响。"
@@ -654,6 +670,8 @@ class _LoginDialog(QDialog):
             if not isinstance(exc, AccessNetworkError):
                 self._pending_activation_auth = None
                 self.login_button.setText("登录")
+                self.step_label.setText("01  登录账号     /     自动检查设备授权")
+                self.status.setStyleSheet("")
             self.status.setText(_friendly_error(exc))
         finally:
             if self.session is None:
