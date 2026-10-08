@@ -110,7 +110,7 @@ def test_pyinstaller_is_onedir_and_embeds_velopack_runtime_hook() -> None:
 
 def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
     manifest = json.loads((ROOT / ".config" / "dotnet-tools.json").read_text(encoding="utf-8"))
-    assert manifest["tools"]["vpk"]["version"] == "1.2.0"
+    assert manifest["tools"]["vpk"]["version"] == "1.2.161"
     assert "dotnet tool restore" in BUILD
     assert '. (Join-Path $PSScriptRoot "velopack_cli.ps1")' in BUILD
     assert "Invoke-RepositoryVelopack" in BUILD
@@ -139,7 +139,9 @@ def test_velopack_process_boundary_removes_only_blank_reserved_environment() -> 
 def test_windows_ci_smokes_canonical_velopack_layout_and_uninstall() -> None:
     assert "actions/setup-dotnet@v4" in WINDOWS
     assert "dotnet tool restore" in WINDOWS
-    assert '"--silent", "--installto", $installDir' in WINDOWS
+    assert '$installDir = Join-Path $env:LOCALAPPDATA "Smirel.ListingStudio"' in WINDOWS
+    assert 'ArgumentList @("--silent")' in WINDOWS
+    assert '"--installto"' not in WINDOWS
     assert 'Join-Path $installDir "Update.exe"' in WINDOWS
     assert 'Join-Path $installDir "current\\EcommerceAgent.exe"' in WINDOWS
     assert '& $worker makro_execute_owned.py --help' in WINDOWS

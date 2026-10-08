@@ -140,4 +140,9 @@ out.write_text(json.dumps({{'returncode': child.returncode, 'stderr': child.stde
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["returncode"] != 0
-    assert "禁止嵌套" in payload["stderr"]
+    stderr = payload["stderr"]
+    assert "RuntimeError" in stderr
+    assert (
+        "禁止嵌套" in stderr
+        or r"\u7981\u6b62\u5d4c\u5957" in stderr
+    )
