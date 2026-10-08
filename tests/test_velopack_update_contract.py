@@ -169,6 +169,11 @@ def test_real_e2e_is_old_velopack_to_new_velopack_and_real_qt_gui() -> None:
     assert "--velopack-e2e-target" in E2E
     assert "real-gui-relaunch.json" in E2E
     assert 'current\\EcommerceAgent.exe' in E2E
+    assert 'current\\sq.version' in E2E
+    assert 'Get-ChildItem $InstallDir -File -Filter "*.exe"' in E2E
+    assert 'Where-Object { $_.Name -ne "Update.exe" }' in E2E
+    assert "expected exactly one root execution stub" in E2E
+    assert '$RootGui = Join-Path $InstallDir "EcommerceAgent.exe"' not in E2E
     assert 'ArgumentList @("--silent", "uninstall")' in E2E
     assert "Velopack E2E uninstall left installation root behind" in E2E
     assert "Velopack E2E passed" in E2E
