@@ -168,5 +168,56 @@ def test_login_window_has_explicit_confirmation_only_for_new_devices():
     assert "_reset_pending_activation()" in methods["_start_oauth"]
 
 
+def _restore_harness(error_factory):
+    import time
+
+    stamp = time.time()
+    clears = []
+    record = {
+        "refresh_token": "saved-refresh",
+        "device_id": "device-id",
+        "validated_at": stamp - 7 * 3600,
+        "grace_until": stamp + 3600,
+        "telemetry_token": "",
+    }
+    session = SimpleNamespace(grace_until=stamp + 3600)
+    def auth_refresh(token):
+        raise error_factory()
+
+    restored = _isolated_function(
+        "_restore_session",
+        {
+            "AccessError": AccessError,
+            "AccessNetworkError": AccessNetworkError,
+            "_load_state": lambda: record,
+            "_clear_state": lambda: clears.append("cleared"),
+            "device_identity": lambda: ("device-id", "this-pc"),
+            "_REVALIDATE_INTERVAL_MS": 6 * 3600 * 1000,
+            "_auth_refresh": auth_refresh,
+            "_session_from_stored": lambda *args, **kwargs: session,
+            "time": time,
+        },
+    )
+    return restored, session, clears
+
+
+def test_transient_refresh_failure_keeps_local_token_and_grace():
+    restore, session, clears = _restore_harness(lambda: AccessNetworkError("service_unavailable", status=503))
+    assert restore() is session
+    assert clears == []
+
+
+def test_permanent_refresh_revocation_discards_cached_token():
+    restore, _session, clears = _restore_harness(lambda: AccessError("invalid_grant", status=400))
+    assert restore() is None
+    assert clears == ["cleared"]
+
+
+def test_unwritable_cache_does_not_erase_existing_credentials():
+    restore, _session, clears = _restore_harness(lambda: AccessError("session_persist_failed"))
+    assert restore() is None
+    assert clears == []
+
+
 def test_syntax_compiles_for_package():
     compile(SOURCE, "gui/app_access.py", "exec")
