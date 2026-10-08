@@ -62,7 +62,7 @@ async function getAuthorizedUser(req: Request) {
 
   const { data: access, error: accessError } = await client
     .from(ACCESS_TABLE)
-    .select("enabled, expires_at")
+    .select("enabled, expires_at, banned_at")
     .eq("user_id", user.id)
     .maybeSingle();
 
@@ -70,6 +70,7 @@ async function getAuthorizedUser(req: Request) {
     console.error("portal access query failed", accessError);
     return { error: "access_check_failed", status: 503 } as const;
   }
+  if (access?.banned_at) return { error: "account_banned", status: 403 } as const;
   if (!access || !access.enabled) {
     return { error: "not_authorized", status: 403 } as const;
   }

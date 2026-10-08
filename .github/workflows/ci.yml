@@ -32,7 +32,8 @@ jobs:
             tests/test_listing_photo_ownership_contract.py \
             tests/test_listing_offer_support_contract.py \
             tests/test_makro_multi_account_ui_contract.py \
-            tests/test_makro_image_requirements.py
+            tests/test_makro_image_requirements.py \
+            tests/test_account_ban_contract.py
 
   windows-updater-contract:
     runs-on: windows-2025

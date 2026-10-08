@@ -387,14 +387,58 @@ Deno.serve(async (req: Request) => {
 
     const { data: access, error: accessError } = await admin
       .from("download_portal_users")
-      .select("enabled, is_admin")
+      .select("enabled, is_admin, banned_at")
       .eq("user_id", user.id)
       .maybeSingle();
     if (accessError) return json(req, { error: "access_check_failed" }, 503);
-    if (!access?.enabled || !access?.is_admin) return json(req, { error: "not_authorized" }, 403);
+    if (!access?.enabled || !access?.is_admin || access.banned_at) return json(req, { error: "not_authorized" }, 403);
 
     let body: JsonObject = {};
     try { body = objectValue(await req.json()); } catch { body = {}; }
+    // Ban mutations run exclusively behind verified owner access. The RPC
+    // enforces the same owner check inside a single DB transaction.
+    const action = textValue(body.action).toLowerCase();
+    if (action === "ban" || action === "unban") {
+      const targetId = textValue(body.target_user_id).toLowerCase();
+      const reason = textValue(body.reason);
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(targetId)) {
+        return json(req, { error: "invalid_target" }, 400);
+      }
+      if (reason.length > 500 || (action === "ban" && !reason)) {
+        return json(req, { error: "invalid_reason" }, 400);
+      }
+      // For unban, lift the Auth ban first; the application stays blocked
+      // until the transactional license/telemetry gate is successfully cleared.
+      if (action === "unban") {
+        const { error: authError } = await admin.auth.admin.updateUserById(targetId, {
+          ban_duration: "none",
+        });
+        if (authError) return json(req, { error: "auth_unban_failed" }, 503);
+      }
+      const { data: changed, error: changeError } = await admin.rpc("set_listing_account_ban_v1", {
+        p_actor: user.id, p_target: targetId, p_action: action, p_reason: reason,
+      });
+      if (changeError) return json(req, { error: "ban_change_failed" }, 503);
+      const outcome = objectValue(changed);
+      if (outcome.error) {
+        const code = textValue(outcome.error);
+        const status = code === "not_authorized" ? 403 : code === "account_not_found" ? 404 : 400;
+        return json(req, { error: code }, status);
+      }
+      cache.delete(`snapshot:${user.id}`);
+      if (action === "ban") {
+        // The DB is already blocked and device tokens revoked even if Auth
+        // rejects the second step. Never report a partial ban as a full success.
+        const { error: authError } = await admin.auth.admin.updateUserById(targetId, {
+          ban_duration: "876000h",
+        });
+        if (authError) {
+          console.error("Auth ban sync failed", authError.message);
+          return json(req, { error: "auth_ban_failed", application_ban_applied: true }, 503);
+        }
+      }
+      return json(req, outcome);
+    }
     const requested = textValue(body.scope || body.mode).toLowerCase();
     const scope: Scope = requested === "core" || requested === "ops" || requested === "heatmap" || requested === "task_detail"
       ? requested as Scope
@@ -451,6 +495,17 @@ Deno.serve(async (req: Request) => {
     if (snapshot.stale) partialErrors.push({ component: "summary", code: "stale_cache" });
 
     if (scope === "core") {
+      // Never cache moderation state: a fresh refresh must show the latest ban.
+      const { data: accounts, error: accountError } = await admin
+        .from("download_portal_users")
+        .select("user_id,display_name,enabled,is_admin,banned_at,ban_reason,banned_by")
+        .order("display_name", { ascending: true });
+      if (accountError) {
+        payload.account_statuses = [];
+        partialErrors.push({ component: "account_statuses", code: "query_failed" });
+      } else {
+        payload.account_statuses = Array.isArray(accounts) ? accounts : [];
+      }
       try {
         const tasks = await loadTaskSummaries(admin, user.id);
         payload.task_audits = tasks.value;

@@ -71,6 +71,7 @@ function randomTelemetryToken(): string {
 function rpcErrorStatus(error: string): number {
   if (error === "invalid_device") return 400;
   if (
+    error === "account_banned" ||
     error === "not_authorized" ||
     error === "access_expired" ||
     error === "device_revoked" ||
@@ -109,6 +110,11 @@ Deno.serve(async (req: Request) => {
   }
 
   const admin = adminClient();
+  // A banned account is rejected for every action, including deactivation.
+  const { data: access, error: accessError } = await admin
+    .from(ACCESS_TABLE).select("banned_at").eq("user_id", auth.user.id).maybeSingle();
+  if (accessError) return json(req, { error: "access_check_failed" }, 503);
+  if (access?.banned_at) return json(req, { error: "account_banned" }, 403);
   const nowIso = new Date().toISOString();
 
   if (action === "deactivate") {
