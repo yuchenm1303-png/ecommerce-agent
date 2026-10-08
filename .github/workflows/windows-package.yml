@@ -78,6 +78,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pytest -q `
+            tests/test_desktop_oauth.py `
             tests/test_windows_packaging_contract.py `
             tests/test_velopack_update_contract.py `
             tests/test_app_update_ui_contract.py `
