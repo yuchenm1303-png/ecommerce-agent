@@ -16,7 +16,7 @@ import urllib.request
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.desktop_oauth import DesktopOAuthError, run_social_oauth
 
@@ -574,6 +574,13 @@ class _LoginDialog(QDialog):
         self._oauth_poll = QTimer(self)
         self._oauth_poll.setInterval(100)
         self._oauth_poll.timeout.connect(self._poll_oauth_result)
+        self._login_cancel_event: threading.Event | None = None
+        self._login_finished: threading.Event | None = None
+        self._login_outcome: dict[str, Any] = {}
+        self._login_activation = False
+        self._login_poll = QTimer(self)
+        self._login_poll.setInterval(100)
+        self._login_poll.timeout.connect(self._poll_login_result)
 
         self.google_button = QPushButton("使用 Google 继续")
         self.google_button.setObjectName("oauthProviderButton")
@@ -701,24 +708,82 @@ class _LoginDialog(QDialog):
         auth = self._pending_activation_auth
         if auth is None:
             return
-        self._set_busy(True)
         self.status.setText("正在激活当前设备并保存登录状态…")
-        QApplication.processEvents()
-        try:
-            session = _complete_sign_in(auth, action="activate")
+
+        def _worker() -> dict[str, Any]:
+            session = _complete_sign_in(auth, action="activate", persist=False)
+            return {"session": session}
+
+        self._run_login_worker(_worker, activation=True)
+
+    def _run_login_worker(
+        self,
+        action: Callable[[], dict[str, Any]],
+        *,
+        activation: bool = False,
+    ) -> None:
+        if self._login_finished is not None and not self._login_finished.is_set():
+            return
+        cancel = threading.Event()
+        finished = threading.Event()
+        outcome: dict[str, Any] = {}
+        self._login_cancel_event = cancel
+        self._login_finished = finished
+        self._login_outcome = outcome
+        self._login_activation = activation
+        self._set_busy(True)
+
+        def _worker() -> None:
+            try:
+                result = action()
+                if not cancel.is_set():
+                    outcome.update(result)
+            except AccessError as exc:
+                outcome["error"] = exc
+            except Exception:
+                outcome["error"] = AccessError("request_failed")
+            finally:
+                finished.set()
+
+        threading.Thread(target=_worker, name="listing-studio-password-auth", daemon=True).start()
+        self._login_poll.start()
+
+    def _poll_login_result(self) -> None:
+        finished = self._login_finished
+        if finished is None or not finished.is_set():
+            return
+        self._login_poll.stop()
+        result = self._login_outcome
+        activation = self._login_activation
+        self._login_finished = None
+        self._login_cancel_event = None
+
+        session = result.get("session")
+        if isinstance(session, ApplicationAccessSession):
+            try:
+                _save_state(session)
+            except AccessError as exc:
+                self.status.setText(_friendly_error(exc))
+                self._set_busy(False)
+                return
             self.session = session
             self._pending_activation_auth = None
             self.accept()
-        except AccessError as exc:
-            if not isinstance(exc, AccessNetworkError):
-                self._pending_activation_auth = None
-                self.login_button.setText("登录")
-                self.step_label.setText("01  登录账号     /     自动检查设备授权")
-                self.status.setStyleSheet("")
-            self.status.setText(_friendly_error(exc))
-        finally:
-            if self.session is None:
-                self._set_busy(False)
+            return
+
+        pending = result.get("pending_auth")
+        if isinstance(pending, dict):
+            self._prepare_activation(pending)
+            return
+
+        error = result.get("error")
+        if activation and isinstance(error, AccessError) and not isinstance(error, AccessNetworkError):
+            self._pending_activation_auth = None
+            self.login_button.setText("登录")
+            self.step_label.setText("01  登录账号     /     自动检查设备授权")
+            self.status.setStyleSheet("")
+        self.status.setText(_friendly_error(error) if isinstance(error, AccessError) else "登录未完成，请重试。")
+        self._set_busy(False)
 
     def _set_busy(self, busy: bool) -> None:
         self.email.setEnabled(not busy)
@@ -733,6 +798,9 @@ class _LoginDialog(QDialog):
         if self._oauth_cancel_event is not None:
             self._oauth_cancel_event.set()
         self._oauth_poll.stop()
+        if self._login_cancel_event is not None:
+            self._login_cancel_event.set()
+        self._login_poll.stop()
 
     def _start_oauth(self, provider: str) -> None:
         if self._oauth_finished is not None and not self._oauth_finished.is_set():
@@ -761,9 +829,6 @@ class _LoginDialog(QDialog):
                     user_agent=f"ListingStudio/{_installed_version()}",
                     cancel_event=cancel_event,
                 )
-                if cancel_event.is_set():
-                    raise DesktopOAuthError("oauth_cancelled")
-
                 if cancel_event.is_set():
                     raise DesktopOAuthError("oauth_cancelled")
                 try:
@@ -839,26 +904,19 @@ class _LoginDialog(QDialog):
             self.status.setText("请输入邮箱和密码。")
             return
 
-        self._set_busy(True)
         self.status.setText("正在登录并检查已有设备授权…")
-        QApplication.processEvents()
 
-        try:
+        def _worker() -> dict[str, Any]:
             auth = _auth_password(email, password)
             try:
-                session = _complete_sign_in(auth, action="validate")
+                session = _complete_sign_in(auth, action="validate", persist=False)
             except AccessError as exc:
                 if exc.code != "device_not_activated":
                     raise
-                self._prepare_activation(auth)
-                return
-            self.session = session
-            self.accept()
-        except AccessError as exc:
-            self.status.setText(_friendly_error(exc))
-        finally:
-            if self.session is None:
-                self._set_busy(False)
+                return {"pending_auth": auth}
+            return {"session": session}
+
+        self._run_login_worker(_worker)
 
 
 def ensure_application_access(app: QApplication) -> ApplicationAccessSession | None:
