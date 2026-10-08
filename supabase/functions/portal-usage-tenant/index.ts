@@ -407,6 +407,12 @@ Deno.serve(async (req: Request) => {
     const user = userData?.user;
     if (userError || !user) return json(req, { error: "invalid_auth" }, 401);
 
+    const { data: access, error: accessError } = await admin
+      .from("download_portal_users").select("enabled,banned_at")
+      .eq("user_id", user.id).maybeSingle();
+    if (accessError) return json(req, { error: "access_check_failed" }, 503);
+    if (!access?.enabled || access.banned_at) return json(req, { error: "not_authorized" }, 403);
+
     let tenantScope: TenantScope;
     try {
       tenantScope = await resolveTenantScope(admin, user.id);
