@@ -1,7 +1,9 @@
 # Stable publication trigger
 
-This branch exists only to trigger the guarded Publish Update workflow.
+Source of truth: `main`
 
-Source of truth for publication: `main`
-Requested version: `auto`
-Purpose: ship Listing Studio desktop Google/GitHub sign-in and the validated Windows packaging fixes.
+Retry after release contract/toolchain pin alignment.
+Expected Stable: `v0.1.67`
+Source main commit at trigger time: `f1e3a066b582bcb2c8c5acc2b11e3858b38eacff`
+
+Purpose: ship Listing Studio desktop Google/GitHub sign-in and validated Windows packaging/release fixes.
