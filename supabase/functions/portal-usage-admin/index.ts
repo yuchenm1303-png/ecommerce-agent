@@ -407,6 +407,14 @@ Deno.serve(async (req: Request) => {
       if (reason.length > 500 || (action === "ban" && !reason)) {
         return json(req, { error: "invalid_reason" }, 400);
       }
+      // For unban, lift the Auth ban first; the application stays blocked
+      // until the transactional license/telemetry gate is successfully cleared.
+      if (action === "unban") {
+        const { error: authError } = await admin.auth.admin.updateUserById(targetId, {
+          ban_duration: "none",
+        });
+        if (authError) return json(req, { error: "auth_unban_failed" }, 503);
+      }
       const { data: changed, error: changeError } = await admin.rpc("set_listing_account_ban_v1", {
         p_actor: user.id, p_target: targetId, p_action: action, p_reason: reason,
       });
@@ -418,6 +426,17 @@ Deno.serve(async (req: Request) => {
         return json(req, { error: code }, status);
       }
       cache.delete(`snapshot:${user.id}`);
+      if (action === "ban") {
+        // The DB is already blocked and device tokens revoked even if Auth
+        // rejects the second step. Never report a partial ban as a full success.
+        const { error: authError } = await admin.auth.admin.updateUserById(targetId, {
+          ban_duration: "876000h",
+        });
+        if (authError) {
+          console.error("Auth ban sync failed", authError.message);
+          return json(req, { error: "auth_ban_failed", application_ban_applied: true }, 503);
+        }
+      }
       return json(req, outcome);
     }
     const requested = textValue(body.scope || body.mode).toLowerCase();
