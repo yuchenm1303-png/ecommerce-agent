@@ -42,7 +42,7 @@ _DOWNLOAD_URL = f"{_SUPABASE_URL}/functions/v1/portal-download"
 _TELEMETRY_URL = f"{_SUPABASE_URL}/functions/v1/portal-telemetry"
 _FINGERPRINT_VERSION = 1
 _HTTP_TIMEOUT_SECONDS = 12
-_REVALIDATE_INTERVAL_MS = 6 * 60 * 60 * 1000
+_REVALIDATE_INTERVAL_MS = 3 * 60 * 1000
 _OFFLINE_RETRY_INTERVAL_MS = 30 * 60 * 1000
 
 
@@ -390,18 +390,8 @@ def _restore_session() -> ApplicationAccessSession | None:
         _save_state(session)
         return session
     except AccessNetworkError:
-        try:
-            session = _session_from_stored(
-                stored,
-                refresh_token=refresh_token,
-                device_id=device_id,
-                device_name=device_name,
-                offline_grace=True,
-            )
-        except (TypeError, ValueError):
-            return None
-        if session.grace_until > time.time():
-            return session
+        # Fail closed if live authorization cannot be checked. Cached grace
+        # would otherwise let revoked users continue working for 72 hours.
         return None
     except AccessError:
         _clear_state()
@@ -451,6 +441,7 @@ def _friendly_error(error: AccessError) -> str:
         "email_not_confirmed": "邮箱尚未完成验证。",
         "invalid_auth": "登录状态无效，请重新登录。",
         "not_authorized": "该账号尚未获得 Listing Studio 使用权限。",
+        "account_banned": "该账号已被管理员封禁，请联系管理员处理。",
         "access_expired": "该账号的 Listing Studio 授权已过期。",
         "device_limit_reached": "当前账号已达到设备授权数量上限。",
         "device_revoked": "这台设备的授权已被管理员撤销。",
@@ -671,12 +662,10 @@ class ApplicationAccessController(QObject):
             self._schedule(_REVALIDATE_INTERVAL_MS)
             return True
         except AccessNetworkError:
-            if self.session.grace_until > time.time():
-                self.session.offline_grace = True
-                self._schedule(_OFFLINE_RETRY_INTERVAL_MS)
-                return False
+            # Require online validation for account bans; offline grace would
+            # silently bypass a ban issued while the client was running.
             if show_failure:
-                self._deny("授权服务器暂时不可用，且离线宽限期已结束。")
+                self._deny("无法连接授权服务器，已暂停使用。恢复网络后可重新登录。")
             return False
         except AccessError as exc:
             if show_failure:
