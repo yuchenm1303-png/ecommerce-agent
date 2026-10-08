@@ -72,7 +72,7 @@ try {
         $global:LASTEXITCODE = 0
         & dotnet tool run vpk -- --help *> $null
         if ($LASTEXITCODE -ne 0) { throw "Pinned Velopack CLI failed to start" }
-        $ToolVersion = "1.2.0"
+        $ToolVersion = "1.2.161"
     }
 
     $SourceSha = (& git rev-parse HEAD).Trim()
