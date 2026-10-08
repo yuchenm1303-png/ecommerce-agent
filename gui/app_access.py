@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.desktop_oauth import DesktopOAuthError, run_social_oauth
+
 from PySide6.QtCore import QObject, QTimer, Qt
 from PySide6.QtWidgets import (
     QApplication,
@@ -456,6 +458,12 @@ def _friendly_error(error: AccessError) -> str:
         "device_revoked": "这台设备的授权已被管理员撤销。",
         "device_not_activated": "这台设备尚未激活。",
         "network_unavailable": "无法连接授权服务器，请检查网络后重试。",
+        "oauth_cancelled": "已取消快捷登录。",
+        "oauth_timeout": "快捷登录等待超时，请重新尝试。",
+        "oauth_callback_port_busy": "快捷登录回调端口被其他程序占用，请关闭占用程序后重试。",
+        "browser_open_failed": "无法打开系统浏览器，请检查默认浏览器设置。",
+        "oauth_provider_failed": "第三方登录未完成，请重新尝试。",
+        "oauth_callback_invalid": "快捷登录回调无效，请重新尝试。",
     }.get(error.code, "授权验证失败，请稍后重试。")
 
 
@@ -473,6 +481,29 @@ class _LoginDialog(QDialog):
         subtitle = QLabel("登录已授权账号后才能使用正式安装版。")
         subtitle.setWordWrap(True)
         subtitle.setObjectName("accessSubtitle")
+
+        self._oauth_cancel_event: threading.Event | None = None
+        self._oauth_finished: threading.Event | None = None
+        self._oauth_outcome: dict[str, Any] = {}
+        self._oauth_poll = QTimer(self)
+        self._oauth_poll.setInterval(100)
+        self._oauth_poll.timeout.connect(self._poll_oauth_result)
+
+        self.google_button = QPushButton("使用 Google 继续")
+        self.google_button.setObjectName("oauthProviderButton")
+        self.github_button = QPushButton("使用 GitHub 继续")
+        self.github_button.setObjectName("oauthProviderButton")
+        self.google_button.clicked.connect(lambda: self._start_oauth("google"))
+        self.github_button.clicked.connect(lambda: self._start_oauth("github"))
+
+        oauth_buttons = QHBoxLayout()
+        oauth_buttons.setSpacing(10)
+        oauth_buttons.addWidget(self.google_button)
+        oauth_buttons.addWidget(self.github_button)
+
+        oauth_separator = QLabel("或使用邮箱密码")
+        oauth_separator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        oauth_separator.setObjectName("accessSeparator")
 
         self.email = QLineEdit()
         self.email.setPlaceholderText("name@example.com")
@@ -514,6 +545,8 @@ class _LoginDialog(QDialog):
         layout.setSpacing(14)
         layout.addWidget(title)
         layout.addWidget(subtitle)
+        layout.addLayout(oauth_buttons)
+        layout.addWidget(oauth_separator)
         layout.addLayout(form)
         layout.addWidget(self.show_password)
         layout.addWidget(self.status)
@@ -524,10 +557,14 @@ class _LoginDialog(QDialog):
             QDialog { background: #111923; color: #eef5fb; }
             QLabel#accessTitle { font-size: 24px; font-weight: 700; }
             QLabel#accessSubtitle, QLabel#accessStatus { color: #9eb0bf; }
+            QLabel#accessSeparator { color: #718797; font-size: 12px; padding: 1px 0; }
             QLineEdit { min-height: 36px; padding: 0 10px; border: 1px solid #314150; border-radius: 8px; background: #18232e; color: #f4f8fb; }
             QLineEdit:focus { border-color: #73c8d8; }
             QPushButton { min-height: 36px; padding: 0 16px; border: 1px solid #334858; border-radius: 8px; background: #1c2a36; color: #eaf4fb; }
             QPushButton:default { background: #2f7282; border-color: #63b8ca; }
+            QPushButton#oauthProviderButton { min-height: 40px; background: #20303d; border-color: #3a5263; font-weight: 650; }
+            QPushButton#oauthProviderButton:hover { background: #2a3d4b; border-color: #527286; }
+            QPushButton:disabled { color: #6f808d; background: #18232e; border-color: #293946; }
             QCheckBox { color: #aebdca; }
             """
         )
@@ -536,6 +573,113 @@ class _LoginDialog(QDialog):
         if previous.get("email"):
             self.email.setText(str(previous["email"]))
 
+    def _set_busy(self, busy: bool) -> None:
+        self.email.setEnabled(not busy)
+        self.password.setEnabled(not busy)
+        self.show_password.setEnabled(not busy)
+        self.google_button.setEnabled(not busy)
+        self.github_button.setEnabled(not busy)
+        self.login_button.setEnabled(not busy)
+        self.cancel_button.setEnabled(True)
+
+    def _cancel_oauth(self) -> None:
+        if self._oauth_cancel_event is not None:
+            self._oauth_cancel_event.set()
+        self._oauth_poll.stop()
+
+    def _start_oauth(self, provider: str) -> None:
+        if self._oauth_finished is not None and not self._oauth_finished.is_set():
+            return
+
+        cancel_event = threading.Event()
+        finished = threading.Event()
+        outcome: dict[str, Any] = {}
+        self._oauth_cancel_event = cancel_event
+        self._oauth_finished = finished
+        self._oauth_outcome = outcome
+        self._set_busy(True)
+
+        provider_label = "Google" if provider == "google" else "GitHub"
+        self.status.setText(
+            f"正在打开 {provider_label} 登录。请在系统浏览器完成授权，完成后会自动返回 Listing Studio。"
+        )
+
+        def _worker() -> None:
+            try:
+                auth = run_social_oauth(
+                    provider,
+                    supabase_url=_SUPABASE_URL,
+                    publishable_key=_SUPABASE_PUBLISHABLE_KEY,
+                    user_agent=f"ListingStudio/{_installed_version()}",
+                    cancel_event=cancel_event,
+                )
+                if cancel_event.is_set():
+                    raise DesktopOAuthError("oauth_cancelled")
+
+                access_token = str(auth.get("access_token") or "")
+                if not access_token:
+                    raise AccessError("invalid_auth")
+                device_id, device_name = device_identity()
+                licensed = _license_check(
+                    access_token,
+                    action="activate",
+                    device_id=device_id,
+                    device_name=device_name,
+                )
+                session = _session_from_auth(
+                    auth,
+                    licensed,
+                    device_id=device_id,
+                    device_name=device_name,
+                )
+                if not session.refresh_token:
+                    raise AccessError("invalid_auth")
+                if cancel_event.is_set():
+                    raise DesktopOAuthError("oauth_cancelled")
+                _save_state(session)
+                outcome["session"] = session
+            except DesktopOAuthError as exc:
+                outcome["error"] = AccessError(exc.code, status=exc.status)
+            except AccessError as exc:
+                outcome["error"] = exc
+            except Exception:
+                outcome["error"] = AccessError("oauth_provider_failed")
+            finally:
+                finished.set()
+
+        threading.Thread(
+            target=_worker,
+            name=f"listing-studio-oauth-{provider}",
+            daemon=True,
+        ).start()
+        self._oauth_poll.start()
+
+    def _poll_oauth_result(self) -> None:
+        finished = self._oauth_finished
+        if finished is None or not finished.is_set():
+            return
+        self._oauth_poll.stop()
+
+        session = self._oauth_outcome.get("session")
+        error = self._oauth_outcome.get("error")
+        self._oauth_finished = None
+        self._oauth_cancel_event = None
+
+        if isinstance(session, ApplicationAccessSession):
+            self.session = session
+            self.accept()
+            return
+
+        self._set_busy(False)
+        if isinstance(error, AccessError):
+            self.status.setText(_friendly_error(error))
+        else:
+            self.status.setText("快捷登录未完成，请重新尝试。")
+
+    def reject(self) -> None:
+        self._cancel_oauth()
+        super().reject()
+
     def _login(self) -> None:
         email = self.email.text().strip()
         password = self.password.text()
@@ -543,8 +687,7 @@ class _LoginDialog(QDialog):
             self.status.setText("请输入邮箱和密码。")
             return
 
-        self.login_button.setEnabled(False)
-        self.cancel_button.setEnabled(False)
+        self._set_busy(True)
         self.status.setText("正在验证账号与设备权限…")
         QApplication.processEvents()
 
@@ -575,8 +718,8 @@ class _LoginDialog(QDialog):
         except AccessError as exc:
             self.status.setText(_friendly_error(exc))
         finally:
-            self.login_button.setEnabled(True)
-            self.cancel_button.setEnabled(True)
+            if self.session is None:
+                self._set_busy(False)
 
 
 def ensure_application_access(app: QApplication) -> ApplicationAccessSession | None:
