@@ -144,6 +144,11 @@ def test_windows_ci_smokes_canonical_velopack_layout_and_uninstall() -> None:
     assert '"--installto"' not in WINDOWS
     assert 'Join-Path $installDir "Update.exe"' in WINDOWS
     assert 'Join-Path $installDir "current\\EcommerceAgent.exe"' in WINDOWS
+    assert 'Join-Path $installDir "current\\sq.version"' in WINDOWS
+    assert 'Get-ChildItem $installDir -File -Filter "*.exe"' in WINDOWS
+    assert 'Where-Object { $_.Name -ne "Update.exe" }' in WINDOWS
+    assert "Expected exactly one Velopack root execution stub" in WINDOWS
+    assert '$stub = Join-Path $installDir "EcommerceAgent.exe"' not in WINDOWS
     assert '& $worker makro_execute_owned.py --help' in WINDOWS
     assert "Installed owned-execute worker dispatch failed" in WINDOWS
     assert 'ArgumentList @("--silent", "uninstall")' in WINDOWS
