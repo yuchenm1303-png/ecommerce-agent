@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -15,7 +16,7 @@ import urllib.request
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.desktop_oauth import DesktopOAuthError, run_social_oauth
 
@@ -43,7 +44,8 @@ _LICENSE_URL = f"{_SUPABASE_URL}/functions/v1/portal-license"
 _DOWNLOAD_URL = f"{_SUPABASE_URL}/functions/v1/portal-download"
 _TELEMETRY_URL = f"{_SUPABASE_URL}/functions/v1/portal-telemetry"
 _FINGERPRINT_VERSION = 1
-_HTTP_TIMEOUT_SECONDS = 12
+_HTTP_TIMEOUT_SECONDS = 22
+_LICENSE_RETRY_DELAYS_SECONDS = (0.8, 2.0)
 _REVALIDATE_INTERVAL_MS = 6 * 60 * 60 * 1000
 _OFFLINE_RETRY_INTERVAL_MS = 30 * 60 * 1000
 
@@ -224,12 +226,27 @@ def _installed_version() -> str:
         return "0.0.0"
 
 
+def _connection_failure_code(exc: BaseException) -> str:
+    """Keep transport failures distinguishable without exposing account data."""
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, socket.gaierror):
+        return "network_dns_failure"
+    if isinstance(reason, ssl.SSLError):
+        return "network_tls_failure"
+    if isinstance(reason, TimeoutError) or "timed out" in str(reason).casefold():
+        return "network_timeout"
+    return "network_unavailable"
+
+
 def _request_json(
     url: str,
     payload: dict[str, Any],
     *,
     access_token: str = "",
+    retry_transient: bool = False,
 ) -> dict[str, Any]:
+    # Refresh tokens are single-use. Do NOT automatically retry a refresh whose
+    # response may have been lost: it might already have rotated the token.
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
@@ -239,26 +256,32 @@ def _request_json(
     }
     if access_token:
         headers["Authorization"] = f"Bearer {access_token}"
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
-            raw = response.read().decode("utf-8")
-            parsed = json.loads(raw) if raw else {}
-            return parsed if isinstance(parsed, dict) else {}
-    except urllib.error.HTTPError as exc:
+    retries = _LICENSE_RETRY_DELAYS_SECONDS if retry_transient else ()
+    for attempt in range(len(retries) + 1):
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            raw = exc.read().decode("utf-8")
-            parsed = json.loads(raw) if raw else {}
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            parsed = {}
-        code = str(parsed.get("error") or parsed.get("error_code") or "request_failed")
-        status = int(exc.code or 0)
-        # Rate limits and server-side errors must not erase a valid local login.
-        if status == 429 or status >= 500:
-            raise AccessNetworkError("service_unavailable", status=status) from exc
-        raise AccessError(code, status=status) from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise AccessNetworkError("network_unavailable") from exc
+            with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
+                raw = response.read().decode("utf-8")
+                parsed = json.loads(raw) if raw else {}
+                return parsed if isinstance(parsed, dict) else {}
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8")
+                parsed = json.loads(raw) if raw else {}
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                parsed = {}
+            code = str(parsed.get("error") or parsed.get("error_code") or "request_failed")
+            status = int(exc.code or 0)
+            if status == 429 or status >= 500:
+                failure = AccessNetworkError("service_unavailable", status=status)
+            else:
+                raise AccessError(code, status=status) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            failure = AccessNetworkError(_connection_failure_code(exc))
+        if attempt >= len(retries):
+            raise failure
+        time.sleep(retries[attempt])
+    raise RuntimeError("unreachable network retry state")
 
 
 def _auth_password(email: str, password: str) -> dict[str, Any]:
@@ -286,6 +309,7 @@ def _license_check(
             "app_version": _installed_version(),
         },
         access_token=access_token,
+        retry_transient=action == "validate",
     )
 
 
@@ -408,12 +432,26 @@ def _restore_session() -> ApplicationAccessSession | None:
         except (TypeError, ValueError):
             pass
 
+    current_refresh_token = refresh_token
     try:
         auth = _auth_refresh(refresh_token)
         access_token = str(auth.get("access_token") or "")
         new_refresh = str(auth.get("refresh_token") or refresh_token)
         if not access_token:
             raise AccessError("invalid_auth")
+        # Persist a newly rotated single-use refresh token BEFORE the separate
+        # licensing request. A transient licence outage must not strand a
+        # previously authorized device with a consumed refresh token.
+        if new_refresh != refresh_token:
+            interim = _session_from_stored(
+                stored,
+                refresh_token=new_refresh,
+                device_id=device_id,
+                device_name=device_name,
+                offline_grace=False,
+            )
+            _save_state(interim)
+            current_refresh_token = new_refresh
         auth["refresh_token"] = new_refresh
         licensed = _license_check(
             access_token,
@@ -433,7 +471,7 @@ def _restore_session() -> ApplicationAccessSession | None:
         try:
             session = _session_from_stored(
                 stored,
-                refresh_token=refresh_token,
+                refresh_token=current_refresh_token,
                 device_id=device_id,
                 device_name=device_name,
                 offline_grace=True,
@@ -500,7 +538,10 @@ def _friendly_error(error: AccessError) -> str:
         "device_limit_reached": "当前账号已达到设备授权数量上限。",
         "device_revoked": "这台设备的授权已被管理员撤销。",
         "device_not_activated": "这台设备尚未激活。",
-        "network_unavailable": "无法连接授权服务器，请检查网络后重试。",
+        "network_unavailable": "当前无法连接登录服务。请检查网络或稍后重试；已有设备授权不会因此解除。",
+        "network_timeout": "登录服务响应超时。跨境网络可能较慢，请检查连接后重试。",
+        "network_dns_failure": "登录域名解析失败。请检查 DNS 或更换网络后重试。",
+        "network_tls_failure": "登录安全连接建立失败。请检查系统时间、网络证书或代理设置后重试。",
         "oauth_cancelled": "已取消快捷登录。",
         "oauth_timeout": "快捷登录等待超时，请重新尝试。",
         "oauth_callback_port_busy": "快捷登录回调端口被其他程序占用，请关闭占用程序后重试。",
@@ -533,6 +574,13 @@ class _LoginDialog(QDialog):
         self._oauth_poll = QTimer(self)
         self._oauth_poll.setInterval(100)
         self._oauth_poll.timeout.connect(self._poll_oauth_result)
+        self._login_cancel_event: threading.Event | None = None
+        self._login_finished: threading.Event | None = None
+        self._login_outcome: dict[str, Any] = {}
+        self._login_activation = False
+        self._login_poll = QTimer(self)
+        self._login_poll.setInterval(100)
+        self._login_poll.timeout.connect(self._poll_login_result)
 
         self.google_button = QPushButton("使用 Google 继续")
         self.google_button.setObjectName("oauthProviderButton")
@@ -660,24 +708,82 @@ class _LoginDialog(QDialog):
         auth = self._pending_activation_auth
         if auth is None:
             return
-        self._set_busy(True)
         self.status.setText("正在激活当前设备并保存登录状态…")
-        QApplication.processEvents()
-        try:
-            session = _complete_sign_in(auth, action="activate")
+
+        def _worker() -> dict[str, Any]:
+            session = _complete_sign_in(auth, action="activate", persist=False)
+            return {"session": session}
+
+        self._run_login_worker(_worker, activation=True)
+
+    def _run_login_worker(
+        self,
+        action: Callable[[], dict[str, Any]],
+        *,
+        activation: bool = False,
+    ) -> None:
+        if self._login_finished is not None and not self._login_finished.is_set():
+            return
+        cancel = threading.Event()
+        finished = threading.Event()
+        outcome: dict[str, Any] = {}
+        self._login_cancel_event = cancel
+        self._login_finished = finished
+        self._login_outcome = outcome
+        self._login_activation = activation
+        self._set_busy(True)
+
+        def _worker() -> None:
+            try:
+                result = action()
+                if not cancel.is_set():
+                    outcome.update(result)
+            except AccessError as exc:
+                outcome["error"] = exc
+            except Exception:
+                outcome["error"] = AccessError("request_failed")
+            finally:
+                finished.set()
+
+        threading.Thread(target=_worker, name="listing-studio-password-auth", daemon=True).start()
+        self._login_poll.start()
+
+    def _poll_login_result(self) -> None:
+        finished = self._login_finished
+        if finished is None or not finished.is_set():
+            return
+        self._login_poll.stop()
+        result = self._login_outcome
+        activation = self._login_activation
+        self._login_finished = None
+        self._login_cancel_event = None
+
+        session = result.get("session")
+        if isinstance(session, ApplicationAccessSession):
+            try:
+                _save_state(session)
+            except AccessError as exc:
+                self.status.setText(_friendly_error(exc))
+                self._set_busy(False)
+                return
             self.session = session
             self._pending_activation_auth = None
             self.accept()
-        except AccessError as exc:
-            if not isinstance(exc, AccessNetworkError):
-                self._pending_activation_auth = None
-                self.login_button.setText("登录")
-                self.step_label.setText("01  登录账号     /     自动检查设备授权")
-                self.status.setStyleSheet("")
-            self.status.setText(_friendly_error(exc))
-        finally:
-            if self.session is None:
-                self._set_busy(False)
+            return
+
+        pending = result.get("pending_auth")
+        if isinstance(pending, dict):
+            self._prepare_activation(pending)
+            return
+
+        error = result.get("error")
+        if activation and isinstance(error, AccessError) and not isinstance(error, AccessNetworkError):
+            self._pending_activation_auth = None
+            self.login_button.setText("登录")
+            self.step_label.setText("01  登录账号     /     自动检查设备授权")
+            self.status.setStyleSheet("")
+        self.status.setText(_friendly_error(error) if isinstance(error, AccessError) else "登录未完成，请重试。")
+        self._set_busy(False)
 
     def _set_busy(self, busy: bool) -> None:
         self.email.setEnabled(not busy)
@@ -692,6 +798,9 @@ class _LoginDialog(QDialog):
         if self._oauth_cancel_event is not None:
             self._oauth_cancel_event.set()
         self._oauth_poll.stop()
+        if self._login_cancel_event is not None:
+            self._login_cancel_event.set()
+        self._login_poll.stop()
 
     def _start_oauth(self, provider: str) -> None:
         if self._oauth_finished is not None and not self._oauth_finished.is_set():
@@ -720,9 +829,6 @@ class _LoginDialog(QDialog):
                     user_agent=f"ListingStudio/{_installed_version()}",
                     cancel_event=cancel_event,
                 )
-                if cancel_event.is_set():
-                    raise DesktopOAuthError("oauth_cancelled")
-
                 if cancel_event.is_set():
                     raise DesktopOAuthError("oauth_cancelled")
                 try:
@@ -798,26 +904,19 @@ class _LoginDialog(QDialog):
             self.status.setText("请输入邮箱和密码。")
             return
 
-        self._set_busy(True)
         self.status.setText("正在登录并检查已有设备授权…")
-        QApplication.processEvents()
 
-        try:
+        def _worker() -> dict[str, Any]:
             auth = _auth_password(email, password)
             try:
-                session = _complete_sign_in(auth, action="validate")
+                session = _complete_sign_in(auth, action="validate", persist=False)
             except AccessError as exc:
                 if exc.code != "device_not_activated":
                     raise
-                self._prepare_activation(auth)
-                return
-            self.session = session
-            self.accept()
-        except AccessError as exc:
-            self.status.setText(_friendly_error(exc))
-        finally:
-            if self.session is None:
-                self._set_busy(False)
+                return {"pending_auth": auth}
+            return {"session": session}
+
+        self._run_login_worker(_worker)
 
 
 def ensure_application_access(app: QApplication) -> ApplicationAccessSession | None:
@@ -895,6 +994,9 @@ class ApplicationAccessController(QObject):
             refresh_token = str(auth.get("refresh_token") or self.session.refresh_token)
             if not access_token:
                 raise AccessError("invalid_auth")
+            if refresh_token != self.session.refresh_token:
+                self.session.refresh_token = refresh_token
+                _save_state(self.session)
             licensed = _license_check(
                 access_token,
                 action="validate",
@@ -920,6 +1022,9 @@ class ApplicationAccessController(QObject):
                 self._deny("授权服务器暂时不可用，且离线宽限期已结束。")
             return False
         except AccessError as exc:
+            if exc.code == "session_persist_failed":
+                self._schedule(_OFFLINE_RETRY_INTERVAL_MS)
+                return False
             if show_failure:
                 self._deny(_friendly_error(exc))
             return False

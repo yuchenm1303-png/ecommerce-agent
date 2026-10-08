@@ -37,7 +37,7 @@ def test_update_workers_inherit_system_proxy_and_also_keep_a_direct_fallback() -
 
 
 def test_update_discovery_runs_in_a_killable_process_with_a_hard_deadline() -> None:
-    assert '_UPDATE_CHECK_TIMEOUT_SECONDS = 12.0' in RUNTIME
+    assert '_UPDATE_CHECK_TIMEOUT_SECONDS = 36.0' in RUNTIME
     assert 'subprocess.Popen(' in RUNTIME
     assert 'process.wait(timeout=timeout)' in RUNTIME
     assert 'except subprocess.TimeoutExpired as exc:' in RUNTIME
@@ -59,8 +59,8 @@ def test_frozen_update_worker_uses_file_ipc_instead_of_console_streams() -> None
 
 
 def test_update_download_is_isolated_has_idle_timeout_and_fails_over_sources() -> None:
-    assert '_UPDATE_DOWNLOAD_CHECK_TIMEOUT_SECONDS = 12.0' in RUNTIME
-    assert '_UPDATE_DOWNLOAD_IDLE_TIMEOUT_SECONDS = 45.0' in RUNTIME
+    assert '_UPDATE_DOWNLOAD_CHECK_TIMEOUT_SECONDS = 28.0' in RUNTIME
+    assert '_UPDATE_DOWNLOAD_IDLE_TIMEOUT_SECONDS = 110.0' in RUNTIME
     assert 'mode == "download"' in RUNTIME
     assert 'download_update_with_failover' in RUNTIME
     assert 'update download made no progress' in RUNTIME
@@ -78,10 +78,10 @@ def test_manual_update_check_adopts_an_inflight_startup_check_instead_of_silentl
 
 
 def test_stable_build_hydrates_previous_release_and_requires_a_delta() -> None:
-    assert 'download github' in BUILD
-    assert '--repoUrl "https://github.com/yuchenm1303-png/ecommerce-agent"' in BUILD
-    assert '--channel $Channel' in BUILD
-    assert '--outputDir $VelopackDir' in BUILD
+    assert '"download", "github"' in BUILD
+    assert '"--repoUrl", "https://github.com/yuchenm1303-png/ecommerce-agent"' in BUILD
+    assert '"--channel", $Channel' in BUILD
+    assert '"--outputDir", $VelopackDir' in BUILD
     assert '"--delta", "BestSize"' in BUILD
     assert 'Resolve-VelopackDeltaPackage' in BUILD
     assert '[string]$_.Type -eq "Delta"' in BUILD

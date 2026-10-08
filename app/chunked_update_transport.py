@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 VELOPACK_FEED_NAME = "releases.win-x64-stable.json"
-_HTTP_TIMEOUT_SECONDS = 15.0
+_HTTP_TIMEOUT_SECONDS = 40.0
 _STREAM_READ_BYTES = 1024 * 1024
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MANIFEST_SCHEMA = 1
@@ -65,10 +66,13 @@ def _configured_proxy_handler() -> urllib.request.ProxyHandler:
     return urllib.request.ProxyHandler(proxies)
 
 
-def _open(url: str) -> Any:
+def _open(url: str, *, range_start: int = 0) -> Any:
+    headers = {"User-Agent": "ListingStudio-Chunked-Update/1"}
+    if range_start > 0:
+        headers["Range"] = f"bytes={range_start}-"
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "ListingStudio-Chunked-Update/1"},
+        headers=headers,
         method="GET",
     )
     opener = urllib.request.build_opener(_configured_proxy_handler())
@@ -175,6 +179,30 @@ def _copy_response(
     return written
 
 
+def _validated_resume_response(response: Any, offset: int, total: int) -> bool:
+    """Return True only if HTTP 206 proves the exact remaining byte range."""
+    if offset <= 0:
+        return False
+    status = getattr(response, "status", None)
+    if status is None:
+        status = response.getcode()
+    if int(status or 0) == 200:
+        # A CDN that ignores Range is valid: start over, never append full bytes.
+        return False
+    if int(status or 0) != 206:
+        raise ChunkMirrorIntegrityError("unexpected HTTP status for resumed object")
+    value = str(getattr(response, "headers", {}).get("Content-Range", "") or "")
+    match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", value.strip())
+    if (
+        not match
+        or int(match.group(1)) != offset
+        or int(match.group(2)) != total - 1
+        or int(match.group(3)) != total
+    ):
+        raise ChunkMirrorIntegrityError("unsafe or mismatched Content-Range")
+    return True
+
+
 def _download_exact_object(
     url: str,
     destination: Path,
@@ -183,20 +211,41 @@ def _download_exact_object(
     expected_sha256: str = "",
     on_activity: Callable[[], None] | None = None,
 ) -> None:
+    # Transient disconnects are common on cross-border routes. Preserve partial
+    # bytes and try a verified HTTP Range resume; SHA256 still covers the whole
+    # reconstructed object before it is accepted.
     last_error: BaseException | None = None
     attempts = len(_RETRY_DELAYS_SECONDS) + 1
     for attempt in range(attempts):
-        destination.unlink(missing_ok=True)
-        digest = hashlib.sha256()
         try:
-            with _open(url) as response, destination.open("wb") as output:
-                _copy_response(
-                    response,
-                    output,
-                    expected_size=expected_size,
-                    digest=digest,
-                    on_activity=on_activity,
-                )
+            offset = destination.stat().st_size if destination.is_file() else 0
+            if offset > expected_size:
+                destination.unlink(missing_ok=True)
+                offset = 0
+            digest = hashlib.sha256()
+            if offset:
+                with destination.open("rb") as previous:
+                    while True:
+                        block = previous.read(_STREAM_READ_BYTES)
+                        if not block:
+                            break
+                        digest.update(block)
+            if offset < expected_size:
+                with _open(url, range_start=offset) as response:
+                    resume = _validated_resume_response(response, offset, expected_size)
+                    if not resume:
+                        digest = hashlib.sha256()
+                        offset = 0
+                    with destination.open("ab" if resume else "wb") as output:
+                        _copy_response(
+                            response,
+                            output,
+                            expected_size=expected_size - offset,
+                            digest=digest,
+                            on_activity=on_activity,
+                        )
+            if destination.stat().st_size != expected_size:
+                raise ChunkMirrorIntegrityError("mirrored object size mismatch")
             if expected_sha256 and digest.hexdigest().lower() != expected_sha256:
                 raise ChunkMirrorIntegrityError("mirrored object SHA256 mismatch")
             return
@@ -208,8 +257,18 @@ def _download_exact_object(
             ChunkMirrorIntegrityError,
         ) as exc:
             last_error = exc
-            destination.unlink(missing_ok=True)
+            # Wrong ranges, overflowing responses and a fully downloaded but
+            # invalid digest are integrity failures, not resumable disconnects.
+            message = str(exc)
+            if (
+                "unsafe or mismatched Content-Range" in message
+                or "unexpected HTTP status" in message
+                or "exceeded its declared size" in message
+                or "SHA256 mismatch" in message
+            ):
+                destination.unlink(missing_ok=True)
             _retry_delay(attempt)
+    destination.unlink(missing_ok=True)
     if isinstance(last_error, ChunkMirrorIntegrityError):
         raise last_error
     raise ChunkMirrorUnavailable(f"mirrored object unavailable after {attempts} attempts: {last_error}") from last_error

@@ -80,7 +80,7 @@ def test_application_update_flow_delegates_package_semantics_install_and_restart
 
 
 def test_update_discovery_and_download_are_isolated_from_the_qt_process() -> None:
-    assert "_UPDATE_CHECK_TIMEOUT_SECONDS = 12.0" in RUNTIME
+    assert "_UPDATE_CHECK_TIMEOUT_SECONDS = 36.0" in RUNTIME
     assert "def _run_check_worker() -> int:" in RUNTIME
     assert "def _run_download_worker() -> int:" in RUNTIME
     assert "create_update_manager(source).check_for_updates()" in RUNTIME
@@ -91,7 +91,7 @@ def test_update_discovery_and_download_are_isolated_from_the_qt_process() -> Non
     assert "raise UpdateCheckTimeoutError(" in RUNTIME
     assert "_UPDATE_CHECK_RESULT_ENV" in RUNTIME
     assert '_update_info_from_payload(payload.get("info"))' in RUNTIME
-    assert "_UPDATE_DOWNLOAD_IDLE_TIMEOUT_SECONDS = 45.0" in RUNTIME
+    assert "_UPDATE_DOWNLOAD_IDLE_TIMEOUT_SECONDS = 110.0" in RUNTIME
     assert "update download made no progress" in RUNTIME
 
 
@@ -207,13 +207,14 @@ def test_release_publication_is_transactional_and_checks_portal_installer_digest
     assert "Select-Object -Skip 3" in TEST_PUBLISH
 
 
-def test_portal_download_resolves_authorized_stable_version_without_legacy_manifest() -> None:
-    assert 'const MANIFEST_ASSET = "update.json"' not in PORTAL_DOWNLOAD
-    assert "SHA256_DIGEST_RE" in PORTAL_DOWNLOAD
-    assert "installerAsset?.digest" in PORTAL_DOWNLOAD
-    assert 'const installerName = `EcommerceAgent-Setup-${requestedVersion}.exe`' in PORTAL_DOWNLOAD
-    assert 'source: "github_release_stable_version"' in PORTAL_DOWNLOAD
-    assert 'error: "version_not_found"' in PORTAL_DOWNLOAD
+def test_portal_download_uses_authorized_chunked_mirror_with_long_lived_links() -> None:
+    assert 'const DOWNLOAD_BUCKET = "listing-studio-downloads"' in PORTAL_DOWNLOAD
+    assert "SIGNED_CHUNK_TTL_SECONDS = 4 * 60 * 60" in PORTAL_DOWNLOAD
+    assert "createSignedUrls(paths, SIGNED_CHUNK_TTL_SECONDS)" in PORTAL_DOWNLOAD
+    assert 'action === "download_latest"' in PORTAL_DOWNLOAD
+    assert 'action === "download_version"' in PORTAL_DOWNLOAD
+    assert 'delivery: "chunked"' in PORTAL_DOWNLOAD
+    assert "getAuthorizedUser(req)" in PORTAL_DOWNLOAD
 
 
 def test_public_release_metadata_is_a_cached_github_projection_with_cdn_failover() -> None:
