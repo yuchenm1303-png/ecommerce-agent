@@ -207,13 +207,14 @@ def test_release_publication_is_transactional_and_checks_portal_installer_digest
     assert "Select-Object -Skip 3" in TEST_PUBLISH
 
 
-def test_portal_download_resolves_authorized_stable_version_without_legacy_manifest() -> None:
-    assert 'const MANIFEST_ASSET = "update.json"' not in PORTAL_DOWNLOAD
-    assert "SHA256_DIGEST_RE" in PORTAL_DOWNLOAD
-    assert "installerAsset?.digest" in PORTAL_DOWNLOAD
-    assert 'const installerName = `EcommerceAgent-Setup-${requestedVersion}.exe`' in PORTAL_DOWNLOAD
-    assert 'source: "github_release_stable_version"' in PORTAL_DOWNLOAD
-    assert 'error: "version_not_found"' in PORTAL_DOWNLOAD
+def test_portal_download_uses_authorized_chunked_mirror_with_long_lived_links() -> None:
+    assert 'const DOWNLOAD_BUCKET = "listing-studio-downloads"' in PORTAL_DOWNLOAD
+    assert "SIGNED_CHUNK_TTL_SECONDS = 4 * 60 * 60" in PORTAL_DOWNLOAD
+    assert "createSignedUrls(paths, SIGNED_CHUNK_TTL_SECONDS)" in PORTAL_DOWNLOAD
+    assert 'action === "download_latest"' in PORTAL_DOWNLOAD
+    assert 'action === "download_version"' in PORTAL_DOWNLOAD
+    assert 'delivery: "chunked"' in PORTAL_DOWNLOAD
+    assert "getAuthorizedUser(req)" in PORTAL_DOWNLOAD
 
 
 def test_public_release_metadata_is_a_cached_github_projection_with_cdn_failover() -> None:
