@@ -293,6 +293,7 @@ def _complete_sign_in(
     auth: dict[str, Any],
     *,
     action: str = "validate",
+    persist: bool = True,
 ) -> ApplicationAccessSession:
     """Authorize an existing device first; activate only on explicit confirmation."""
     if action not in {"validate", "activate"}:
@@ -314,7 +315,8 @@ def _complete_sign_in(
         device_id=device_id,
         device_name=device_name,
     )
-    _save_state(session)
+    if persist:
+        _save_state(session)
     return session
 
 
@@ -675,6 +677,7 @@ class _LoginDialog(QDialog):
         if self._oauth_finished is not None and not self._oauth_finished.is_set():
             return
 
+        self._reset_pending_activation()
         cancel_event = threading.Event()
         finished = threading.Event()
         outcome: dict[str, Any] = {}
@@ -703,12 +706,14 @@ class _LoginDialog(QDialog):
                 if cancel_event.is_set():
                     raise DesktopOAuthError("oauth_cancelled")
                 try:
-                    session = _complete_sign_in(auth, action="validate")
+                    session = _complete_sign_in(auth, action="validate", persist=False)
                 except AccessError as exc:
                     if exc.code != "device_not_activated":
                         raise
                     outcome["pending_auth"] = auth
                 else:
+                    if cancel_event.is_set():
+                        raise DesktopOAuthError("oauth_cancelled")
                     outcome["session"] = session
             except DesktopOAuthError as exc:
                 outcome["error"] = AccessError(exc.code, status=exc.status)
@@ -739,6 +744,12 @@ class _LoginDialog(QDialog):
         self._oauth_cancel_event = None
 
         if isinstance(session, ApplicationAccessSession):
+            try:
+                _save_state(session)
+            except AccessError as exc:
+                self._set_busy(False)
+                self.status.setText(_friendly_error(exc))
+                return
             self.session = session
             self.accept()
             return
