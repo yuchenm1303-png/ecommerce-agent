@@ -99,13 +99,18 @@ $Setup = Get-SingleVelopackArtifact -Directory $FeedDir -Filter "$PackId*-Setup.
 $Install = Start-Process -FilePath $Setup.FullName -ArgumentList @("--silent", "--installto", $InstallDir) -Wait -PassThru
 if ($Install.ExitCode -ne 0) { throw "Velopack E2E old install failed: $($Install.ExitCode)" }
 
-$RootGui = Join-Path $InstallDir "EcommerceAgent.exe"
 $UpdateExe = Join-Path $InstallDir "Update.exe"
 $CurrentGui = Join-Path $InstallDir "current\EcommerceAgent.exe"
+$SqVersion = Join-Path $InstallDir "current\sq.version"
 $InstalledVersionFile = Join-Path $InstallDir "current\_internal\packaging\VERSION"
-foreach ($Required in @($RootGui, $UpdateExe, $CurrentGui, $InstalledVersionFile)) {
-    if (-not (Test-Path $Required)) { throw "Velopack E2E installed component missing: $Required" }
+foreach ($Required in @($UpdateExe, $CurrentGui, $SqVersion, $InstalledVersionFile)) {
+    if (-not (Test-Path $Required -PathType Leaf)) { throw "Velopack E2E installed component missing: $Required" }
 }
+$RootLaunchers = @(Get-ChildItem $InstallDir -File -Filter "*.exe" | Where-Object { $_.Name -ne "Update.exe" })
+if ($RootLaunchers.Count -ne 1) {
+    throw "Velopack E2E expected exactly one root execution stub, found $($RootLaunchers.Count): $($RootLaunchers.Name -join ', ')"
+}
+$RootGui = $RootLaunchers[0].FullName
 $InstalledOldVersion = (Get-Content $InstalledVersionFile -Raw).Trim()
 if ($InstalledOldVersion -ne $OldVersion) {
     throw "Velopack E2E old install VERSION mismatch: expected=$OldVersion actual=$InstalledOldVersion"
