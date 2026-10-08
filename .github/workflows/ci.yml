@@ -20,8 +20,12 @@ jobs:
       - name: Install targeted test runner
         run: python -m pip install pytest
 
-      - name: Verify sign-in, activation and session recovery
-        run: python -m pytest -q tests/test_application_access_flow.py
+      - name: Verify authentication and mainland network resilience
+        run: |
+          python -m pytest -q \
+            tests/test_application_access_flow.py \
+            tests/test_mainland_network_resilience.py \
+            tests/test_update_network_resilience_contract.py
 
   makro-multi-account-contract:
     runs-on: ubuntu-latest
