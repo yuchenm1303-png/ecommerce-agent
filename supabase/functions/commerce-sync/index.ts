@@ -133,6 +133,15 @@ Deno.serve(async (req: Request) => {
   const userId = text(userData?.user?.id, 64);
   if (userError || !userId) return json({ error: "invalid_auth" }, 401);
 
+  const { data: access, error: accessError } = await admin
+    .from("download_portal_users")
+    .select("enabled,expires_at,banned_at")
+    .eq("user_id", userId).maybeSingle();
+  if (accessError) return json({ error: "access_check_failed" }, 503);
+  if (access?.banned_at) return json({ error: "account_banned" }, 403);
+  if (!access?.enabled) return json({ error: "not_authorized" }, 403);
+  if (access.expires_at && Date.parse(access.expires_at) <= Date.now()) return json({ error: "access_expired" }, 403);
+
   const scope = await resolveWorkspace(admin, userId, requestedWorkspace);
   if (!scope.workspaceId) return json({ error: scope.error || "workspace_forbidden" }, scope.status || 403);
 
