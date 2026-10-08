@@ -45,7 +45,7 @@ declare
   v_reason text := btrim(coalesce(p_reason, ''));
   v_now timestamptz := now();
 begin
-  if p_actor is null or p_target is null or p_action not in ('ban', 'unban') then
+  if p_actor is null or p_target is null or coalesce(p_action, '') not in ('ban', 'unban') then
     return jsonb_build_object('error', 'invalid_request');
   end if;
   if p_actor = p_target then
