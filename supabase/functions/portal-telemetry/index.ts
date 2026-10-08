@@ -171,10 +171,11 @@ Deno.serve(async (req: Request) => {
 
   const { data: access, error: accessError } = await admin
     .from(ACCESS_TABLE)
-    .select("enabled, expires_at")
+    .select("enabled, expires_at, banned_at")
     .eq("user_id", userId)
     .maybeSingle();
   if (accessError) return json({ error: "access_check_failed" }, 503);
+  if (access?.banned_at) return json({ error: "account_banned" }, 403);
   if (!access?.enabled) return json({ error: "not_authorized" }, 403);
   if (access.expires_at && Date.parse(access.expires_at) <= Date.now()) return json({ error: "access_expired" }, 403);
 
