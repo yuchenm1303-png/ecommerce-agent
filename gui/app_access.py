@@ -345,29 +345,8 @@ def _restore_session() -> ApplicationAccessSession | None:
         _clear_state()
         return None
 
-    now = time.time()
-    try:
-        validated_at = float(stored.get("validated_at") or 0.0)
-    except (TypeError, ValueError):
-        validated_at = 0.0
-    validation_age_ms = (now - validated_at) * 1000.0
-    telemetry_token = str(stored.get("telemetry_token") or "")
-    if (
-        telemetry_token
-        and validated_at > 0.0
-        and 0.0 <= validation_age_ms < _REVALIDATE_INTERVAL_MS
-    ):
-        try:
-            return _session_from_stored(
-                stored,
-                refresh_token=refresh_token,
-                device_id=device_id,
-                device_name=device_name,
-                offline_grace=False,
-            )
-        except (TypeError, ValueError):
-            pass
-
+    # Always revalidate with the server on startup, even if the previous
+    # activation was only seconds ago. A cached token is not a ban check.
     try:
         auth = _auth_refresh(refresh_token)
         access_token = str(auth.get("access_token") or "")
