@@ -25,7 +25,8 @@ jobs:
           python -m pytest -q \
             tests/test_application_access_flow.py \
             tests/test_mainland_network_resilience.py \
-            tests/test_update_network_resilience_contract.py
+            tests/test_update_network_resilience_contract.py \
+            tests/test_channel_account_startup.py
 
   makro-multi-account-contract:
     runs-on: ubuntu-latest
