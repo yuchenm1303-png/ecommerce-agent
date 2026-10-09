@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: "Source branch/tag/commit to publish"
+        description: "Source branch/tag/commit to publish (main is recommended for Stable)"
         required: true
-        default: "feat/local-test-gui"
+        default: "main"
         type: string
       version:
         description: "Stable version override (x.y.z) or auto"
