@@ -37,7 +37,11 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         managed_port = self.channel_accounts.cdp_port(self.channel_account)
         self._desired_profile_dir = self.channel_accounts.profile_dir(self.channel_account)
         self._runtime_identity = self.channel_accounts.runtime_identity(self.channel_account)
-        self._runtime_marker = self._runtime_marker_for(self.channel_account)
+        # ManagedMakroBrowser initializes self.project_root only in super().__init__.
+        # Derive the first marker from the constructor's local root instead.
+        self._runtime_marker = self._runtime_marker_for(
+            self.channel_account, project_root=project_root
+        )
         self._account_reconcile_lock = threading.Lock()
         self._account_selection_lock = threading.Lock()
         self._pending_channel_account: ChannelAccount | None = None
@@ -72,9 +76,12 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             raise RuntimeError("当前应用账号缺少 user_id，不能安全绑定 Makro 平台账号。")
         return user_id
 
-    def _runtime_marker_for(self, account: ChannelAccount) -> Path:
+    def _runtime_marker_for(
+        self, account: ChannelAccount, *, project_root: Path | None = None
+    ) -> Path:
+        root = self.project_root if project_root is None else project_root
         return (
-            self.project_root
+            root
             / "channel_accounts"
             / "managed_makro_browsers"
             / self.channel_accounts.scope_token
