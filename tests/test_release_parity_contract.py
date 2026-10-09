@@ -105,3 +105,14 @@ def test_stable_signing_is_optional_but_configuration_remains_validated() -> Non
     assert "VPK_SIGN_PARAMS" in STABLE_WORKFLOW
     assert "VPK_AZURE_TRUSTED_SIGN_FILE" not in TEST_WORKFLOW
     assert "VPK_SIGN_PARAMS" not in TEST_WORKFLOW
+
+
+def test_stable_manual_dispatch_defaults_to_current_main_and_keeps_parity_gate() -> None:
+    # Old "feat/local-test-gui" default caused releases started from main to
+    # package stale feature code and fail before packaging.
+    assert 'source_ref:\n        description: "Source branch/tag/commit to publish (main is recommended for Stable)"\n        required: true\n        default: "main"' in STABLE_WORKFLOW
+    assert 'default: "feat/local-test-gui"' not in STABLE_WORKFLOW
+    assert 'ref: ${{ inputs.source_ref || \'main\' }}' in STABLE_WORKFLOW
+    assert "Require dispatcher/source workflow parity" in STABLE_WORKFLOW
+    assert 'origin/main:.github/workflows/publish-update.yml' in STABLE_WORKFLOW
+    assert "Publish Update workflow drift detected" in STABLE_WORKFLOW
