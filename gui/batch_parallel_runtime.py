@@ -15,6 +15,7 @@ from .batch_browser_session import (
 )
 from .batch_model import load_batch_run, normalize_batch_concurrency, save_batch_run
 from app.ai_profile_store import active_source_path
+from app.runtime_paths import is_frozen
 from app.ai_runtime_binding import apply_active_ai_runtime, freeze_ai_runtime_environment
 from .readonly_runner import RunnerConfig
 
@@ -291,7 +292,7 @@ class BatchParallelRuntime:
         )
         # A recovered account lane must not resume with RunnerConfig Qwen
         # defaults when the saved active profile is a verified relay.
-        if active_source_path().is_file():
+        if active_source_path().is_file() or is_frozen():
             apply_active_ai_runtime(config)
         freeze_ai_runtime_environment(config)
         if int(config.makro_cdp_port) != int(self.manager.port):
