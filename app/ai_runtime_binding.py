@@ -72,7 +72,7 @@ def apply_active_ai_runtime(config: Any) -> Any:
         if not assert_verified_if_managed(
             config_dir=relay_verification_directory(), bindings=ordered
         ):
-            raise CapabilityProbeError("中转站连接池缺少有效的能力验证记录。")
+            raise CapabilityProbeError("中转站连接池缺少能力验证记录，请先完成模型能力测试。")
         semantic, fact, web = ordered
         base_url = semantic.base_url
         semantic_model = semantic.model
