@@ -37,6 +37,15 @@ _AI_CHILD_ENV_NAMES = (
     RUNTIME_WEB_BASE_URL_ENV,
     RUNTIME_WEB_KEY_ENV,
 )
+# These secrets are never needed by child workflows once the selected profile
+# has been resolved. Do not leak unused provider keys across account lanes.
+_UNUSED_PROVIDER_KEYS = (
+    "OPENAI_API_KEY",
+    "ECOMMERCE_AGENT_AI_API_KEY",
+    "ECOMMERCE_AGENT_AI_RELAY_API_KEY",
+    "ECOMMERCE_AGENT_AI_RELAY_2_API_KEY",
+    "ECOMMERCE_AGENT_AI_RELAY_3_API_KEY",
+)
 
 
 def apply_active_ai_runtime(config: Any) -> Any:
@@ -126,7 +135,7 @@ def freeze_ai_runtime_environment(config: Any) -> None:
 def apply_child_ai_environment(environment: Any, config: Any) -> None:
     """Remove inherited cross-lane credentials and inject this run's snapshot."""
     freeze_ai_runtime_environment(config)
-    for name in set(_AI_CHILD_ENV_NAMES) | {str(config.api_key_env)}:
+    for name in set(_AI_CHILD_ENV_NAMES) | set(_UNUSED_PROVIDER_KEYS) | {str(config.api_key_env)}:
         environment.remove(name)
     for name, value in config.runtime_ai_env.items():
         environment.insert(name, value)
