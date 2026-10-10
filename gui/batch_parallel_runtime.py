@@ -14,6 +14,8 @@ from .batch_browser_session import (
     shared_batch_browser,
 )
 from .batch_model import load_batch_run, normalize_batch_concurrency, save_batch_run
+from app.ai_profile_store import active_source_path
+from app.ai_runtime_binding import apply_active_ai_runtime, freeze_ai_runtime_environment
 from .readonly_runner import RunnerConfig
 
 
@@ -287,6 +289,11 @@ class BatchParallelRuntime:
             source_cdp_port=int(workspace.source_port.value()),
             source_use_current_page=False,
         )
+        # A recovered account lane must not resume with RunnerConfig Qwen
+        # defaults when the saved active profile is a verified relay.
+        if active_source_path().is_file():
+            apply_active_ai_runtime(config)
+        freeze_ai_runtime_environment(config)
         if int(config.makro_cdp_port) != int(self.manager.port):
             raise RuntimeError(
                 "恢复 Batch 时当前工作区 Makro CDP 端口与账号专属 lane 不一致；已拒绝执行。"
