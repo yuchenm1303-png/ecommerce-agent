@@ -21,6 +21,12 @@ from .batch_account_lanes import (
     LaneProcessMap,
 )
 from .batch_log_buffer import BATCH_LOG_FLUSH_LINES, BATCH_LOG_PENDING_LINES
+from app.ai_runtime_binding import (
+    apply_active_ai_runtime,
+    apply_child_ai_environment,
+    freeze_ai_runtime_environment,
+)
+from app.ai_profile_store import active_source_path
 from app.batch_source_outcome import source_media_review
 from .batch_model import (
     BATCH_WORKER_DEFAULT,
@@ -382,8 +388,11 @@ class BatchController(QObject):
     ) -> BatchRun:
         if self.is_running:
             raise RuntimeError("Batch 已在运行。")
-        if not os.getenv(config.api_key_env, "").strip():
-            raise ValueError(f"环境变量 {config.api_key_env} 未设置。")
+        # Some per-row and recovered-batch entrypoints bypass the settings UI
+        # wrapper. Resolve the saved profile here, before any worker is queued.
+        if not getattr(config, "runtime_ai_env", None) and active_source_path().is_file():
+            apply_active_ai_runtime(config)
+        freeze_ai_runtime_environment(config)
         self.config = config
         self.batch = create_batch_run(
             self.project_root,
@@ -555,6 +564,10 @@ class BatchController(QObject):
             "--source-cdp-port", str(self.config.source_cdp_port),
             "--source-cache-dir", str(cache),
             "--output-dir", str(output),
+            "--page-state-provider", self.config.provider,
+            "--page-state-base-url", self.config.base_url,
+            "--page-state-model", self.config.local_model,
+            "--page-state-api-key-env", self.config.api_key_env,
         ]
         if resume_interaction:
             args.append("--resume-source-interaction")
@@ -693,6 +706,8 @@ class BatchController(QObject):
         environment = QProcessEnvironment.systemEnvironment()
         environment.insert("PYTHONUTF8", "1")
         environment.insert("PYTHONIOENCODING", "utf-8")
+        assert self.config is not None
+        apply_child_ai_environment(environment, self.config)
         process.setProcessEnvironment(environment)
         self._processes[process] = (job_id, stage)
         self._buffers[process] = ""
@@ -880,9 +895,17 @@ class BatchController(QObject):
                     job.error = error
                     job.stage_detail = stage_detail
                 else:
+                    outcome = self._source_outcome(job)
+                    kind = str(outcome.get("failure_kind") or "")
+                    reason = str(outcome.get("failure_reason") or "").strip()
                     job.failure_stage = job.stage_detail or "采集商品"
                     job.status = "FAILED"
-                    job.error = f"Source Capture exit code={exit_code}"
+                    if kind == "AI_AUTHENTICATION_FAILED":
+                        job.error = "AI 接口认证失败（401）：请检查当前所选 AI 来源的 API Key。"
+                    elif kind == "AI_PAGE_STATE_FAILED":
+                        job.error = reason or "AI 页面识别失败，请查看采集日志。"
+                    else:
+                        job.error = reason or f"Source Capture exit code={exit_code}"
                     job.stage_detail = "采集失败"
                 job.clear_interaction()
             job.touch()
