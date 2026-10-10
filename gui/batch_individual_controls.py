@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.ai_profile_store import active_source_path
 from app.ai_runtime_binding import apply_active_ai_runtime, freeze_ai_runtime_environment
 from .batch_model import BatchJob, normalize_batch_concurrency
 from .listing_offer_support import _clean_intent, _write_intent_sidecar
@@ -312,8 +311,9 @@ class BatchIndividualControls(QObject):
         )
         # A per-row Start may call the original controller method and bypass
         # the global Batch settings wrapper; resolve the active route here too.
-        if active_source_path().is_file():
-            apply_active_ai_runtime(config)
+        # A missing active-source file means the legacy official-Qwen profile;
+        # this per-row route still must load its saved DPAPI key explicitly.
+        apply_active_ai_runtime(config)
         freeze_ai_runtime_environment(config)
         return config
 
