@@ -419,7 +419,7 @@ Deno.serve(async (req: Request) => {
       }
       const { data: revisionRows, error: revisionsError } = await admin
         .from("listing_task_audit_revisions")
-        .select("id,audit_id,phase,status,error_text,review_required,review_reason,task_started_at,task_completed_at,snapshot_origin,recorded_at")
+        .select("id,audit_id,phase,status,error_text,review_required,review_reason,task_started_at,task_completed_at,source_updated_at,snapshot_origin,recorded_at")
         .eq("audit_id", sourceId)
         .order("id", { ascending: false })
         .limit(120);
@@ -441,7 +441,7 @@ Deno.serve(async (req: Request) => {
           input_data: historical.input_data,
           started_at: historical.task_started_at,
           completed_at: historical.task_completed_at,
-          updated_at: historical.recorded_at,
+          updated_at: historical.snapshot_origin === "baseline_import" ? (historical.source_updated_at || historical.recorded_at) : historical.recorded_at,
         });
       }
       let taskLogChunks: JsonObject[] = [];
