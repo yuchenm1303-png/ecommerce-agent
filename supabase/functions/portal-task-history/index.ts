@@ -234,7 +234,7 @@ Deno.serve(async (req: Request) => {
         return json(req, { error: "invalid_revision_cursor" }, 400);
       }
       let query = admin.from("listing_task_audit_revisions")
-        .select("id,audit_id,user_id,device_id,app_version,task_kind,phase,status,review_required,review_reason,product_url,error_text,task_started_at,task_completed_at,snapshot_origin,recorded_at")
+        .select("id,audit_id,user_id,device_id,app_version,task_kind,phase,status,review_required,review_reason,product_url,error_text,task_started_at,task_completed_at,source_updated_at,snapshot_origin,recorded_at")
         .order("id", { ascending: false })
         .limit(limit + 1);
       query = applyViewerScope(query, scope);
@@ -254,7 +254,7 @@ Deno.serve(async (req: Request) => {
             started_at: record.task_started_at,
             completed_at: record.task_completed_at,
             created_at: record.task_started_at || record.recorded_at,
-            updated_at: record.recorded_at,
+            updated_at: record.snapshot_origin === "baseline_import" ? (record.source_updated_at || record.recorded_at) : record.recorded_at,
           }),
           source_audit_id: auditId,
           revision_id: revisionId,
