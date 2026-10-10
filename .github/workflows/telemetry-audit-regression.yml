@@ -1,0 +1,36 @@
+name: Telemetry audit regressions
+on:
+  pull_request:
+    paths:
+      - "gui/**"
+      - "supabase/functions/portal-telemetry/**"
+      - "supabase/migrations/**"
+      - "tests/test_monitor_task_start_failures.py"
+      - "tests/test_task_monitor_audit_reliability.py"
+  push:
+    branches: ["feat/local-test-gui", "fix/telemetry-audit-reliability-20261010"]
+    paths:
+      - "gui/**"
+      - "supabase/functions/portal-telemetry/**"
+      - "supabase/migrations/**"
+      - "tests/test_monitor_task_start_failures.py"
+      - "tests/test_task_monitor_audit_reliability.py"
+jobs:
+  telemetry-regressions:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Qt runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libegl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-gui.txt
+      - name: Validate durable task audit and early failures
+        run: |
+          python -m pytest -q tests/test_task_monitor_audit_reliability.py tests/test_monitor_task_start_failures.py tests/test_usage_telemetry_batch_outcomes.py tests/test_batch_link_telemetry_coordinates.py
