@@ -412,6 +412,38 @@ Deno.serve(async (req: Request) => {
       const normalized = normalizeTaskAudits([row]);
       const logicalId = textValue(body.audit_id);
       const taskAudit = normalized.find((item) => textValue(item.id) === logicalId) ?? normalized[0] ?? row;
+      const requestedRevision = textValue(body.audit_id).split(":revision:")[1] || "";
+      let revisionHistory: JsonObject[] = [];
+      if (requestedRevision && !/^[1-9][0-9]*$/.test(requestedRevision)) {
+        return json(req, { error: "invalid_revision_id" }, 400);
+      }
+      const { data: revisionRows, error: revisionsError } = await admin
+        .from("listing_task_audit_revisions")
+        .select("id,audit_id,phase,status,error_text,review_required,review_reason,task_started_at,task_completed_at,snapshot_origin,recorded_at")
+        .eq("audit_id", sourceId)
+        .order("id", { ascending: false })
+        .limit(120);
+      if (revisionsError) return json(req, { error: "task_revisions_failed" }, 503);
+      revisionHistory = Array.isArray(revisionRows) ? revisionRows.map(objectValue) : [];
+      if (requestedRevision) {
+        const { data: selected, error: selectedError } = await admin
+          .from("listing_task_audit_revisions")
+          .select("*").eq("audit_id", sourceId).eq("id", requestedRevision)
+          .maybeSingle();
+        if (selectedError) return json(req, { error: "task_revision_failed" }, 503);
+        if (!selected) return json(req, { error: "task_revision_not_found" }, 404);
+        const historical = objectValue(selected);
+        Object.assign(taskAudit, {
+          id: sourceId + ":revision:" + requestedRevision,
+          phase: historical.phase, status: historical.status,
+          error_text: historical.error_text,
+          result_data: historical.result_data,
+          input_data: historical.input_data,
+          started_at: historical.task_started_at,
+          completed_at: historical.task_completed_at,
+          updated_at: historical.recorded_at,
+        });
+      }
       let taskLogChunks: JsonObject[] = [];
       try {
         taskLogChunks = await loadTaskLogChunks(admin, sourceId);
@@ -423,6 +455,7 @@ Deno.serve(async (req: Request) => {
         task_audit: taskAudit,
         task_log_chunks: taskLogChunks,
         task_log_chunk_count: taskLogChunks.length,
+        task_revisions: revisionHistory,
       });
     }
 

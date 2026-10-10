@@ -11,8 +11,10 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .app_access import ApplicationAccessController
+from .telemetry_delivery import window_durable_delivery
 from .task_failure_diagnostics import (
     collect_workflow_failure_diagnostic,
+    collect_workflow_log_chunks,
     sanitize_telemetry_value,
 )
 
@@ -630,6 +632,7 @@ class UsageTelemetryController(QObject):
         self.access = access
         self.session_id = str(uuid.uuid4())
         self.network = QNetworkAccessManager(self)
+        self.delivery = window_durable_delivery(window, access)
         self.heartbeat = QTimer(self)
         self.heartbeat.setInterval(_HEARTBEAT_MS)
         self.heartbeat.timeout.connect(self._heartbeat)
@@ -640,6 +643,7 @@ class UsageTelemetryController(QObject):
         self._single_started_at = ""
         self._single_input: dict[str, Any] = {}
         self._single_result: dict[str, Any] = {}
+        self._enqueued_single_chunks: set[tuple[str, str, str, int]] = set()
 
         self._batch_lane_states: dict[str, dict[str, Any]] = {}
         self._batch_dirty_lanes: set[str] = set()
@@ -764,6 +768,14 @@ class UsageTelemetryController(QObject):
         elif action == "task_audit" and audit is not None:
             payload["audit"] = _safe_value(audit, max_text=_MAX_AUDIT_TEXT)
 
+        if action == "task_audit":
+            # Persist before sending; failed/late ACKs never silently erase a task.
+            try:
+                self.delivery.enqueue({"action": action, "audit": payload["audit"]})
+            except OSError as exc:
+                # Observability failure must never crash the user's Makro task.
+                print(f"[telemetry] cannot persist task audit: {type(exc).__name__}")
+            return
         request = QNetworkRequest(QUrl(self.access.telemetry_function_url))
         request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
         reply = self.network.post(
@@ -806,6 +818,36 @@ class UsageTelemetryController(QObject):
                 "completed_at": completed_at,
             },
         )
+
+    def _enqueue_single_logs(self, phase: str) -> None:
+        """Upload sanitized per-run logs for successful and failed Single tasks."""
+        audit_id = self._single_audit_id
+        if not audit_id:
+            return
+        runner = getattr(self.window, "execution_runner" if phase == "listing_execute" else "runner", None)
+        run_dir = _runner_workflow_dir(runner)
+        if not run_dir:
+            return
+        try:
+            chunks = collect_workflow_log_chunks(
+                run_dir, process_log_path=_runner_process_log(runner) or None,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"[telemetry] cannot collect single-run logs: {type(exc).__name__}")
+            return
+        for chunk in chunks:
+            key = (audit_id, str(chunk["sha256"]), str(chunk["name"]), int(chunk["chunk_index"]))
+            if key in self._enqueued_single_chunks:
+                continue
+            try:
+                self.delivery.enqueue({
+                    "action": "task_log_chunk",
+                    "log_chunk": {"audit_id": audit_id, **chunk},
+                })
+                self._enqueued_single_chunks.add(key)
+            except OSError as exc:
+                print(f"[telemetry] cannot persist single-run log: {type(exc).__name__}")
+                return
 
     def _heartbeat(self) -> None:
         self._post("heartbeat")
@@ -1154,6 +1196,7 @@ class UsageTelemetryController(QObject):
                 result_data=self._single_result,
                 started_at=self._single_started_at,
             )
+            self._enqueue_single_logs("listing_prepare")
 
     def _on_prepare_failed(self, *args: Any) -> None:
         if self._prepare_active:
@@ -1183,6 +1226,7 @@ class UsageTelemetryController(QObject):
                 started_at=self._single_started_at,
                 completed_at=_utc_now(),
             )
+            self._enqueue_single_logs("listing_prepare")
 
     def _on_execute_running(self, running: bool) -> None:
         if running and not self._execute_active:
@@ -1233,6 +1277,7 @@ class UsageTelemetryController(QObject):
                 started_at=self._single_started_at,
                 completed_at=_utc_now(),
             )
+            self._enqueue_single_logs("listing_execute")
 
     def _on_execute_failed(self, *args: Any) -> None:
         if self._execute_active:
@@ -1262,6 +1307,7 @@ class UsageTelemetryController(QObject):
                 started_at=self._single_started_at,
                 completed_at=_utc_now(),
             )
+            self._enqueue_single_logs("listing_execute")
 
     def _on_batch_lane_running(self, account_id: str, running: bool) -> None:
         workspace = getattr(self.window, "batch_workspace", None)
@@ -1401,6 +1447,7 @@ def install_usage_telemetry(
         return existing
     controller = UsageTelemetryController(window, access)
     window._usage_telemetry = controller  # type: ignore[attr-defined]
+    controller.delivery.drain()  # Resume queued audits from previous app sessions.
     return controller
 
 

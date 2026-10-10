@@ -228,6 +228,51 @@ Deno.serve(async (req: Request) => {
     let body: JsonObject = {};
     try { body = objectValue(await req.json()); } catch { body = {}; }
     const limit = pageSize(body.limit);
+    if (textValue(body.view) === "revisions") {
+      const requestedCursor = textValue(body.before_revision_id);
+      if (requestedCursor && !/^[1-9][0-9]*$/.test(requestedCursor)) {
+        return json(req, { error: "invalid_revision_cursor" }, 400);
+      }
+      let query = admin.from("listing_task_audit_revisions")
+        .select("id,audit_id,user_id,device_id,app_version,task_kind,phase,status,review_required,review_reason,product_url,error_text,task_started_at,task_completed_at,snapshot_origin,recorded_at")
+        .order("id", { ascending: false })
+        .limit(limit + 1);
+      query = applyViewerScope(query, scope);
+      if (requestedCursor) query = query.lt("id", requestedCursor);
+      const { data, error } = await query;
+      if (error) return json(req, { error: "task_revision_page_failed" }, 503);
+      const revisions = Array.isArray(data) ? data.map(objectValue) : [];
+      const hasMore = revisions.length > limit;
+      const pageRows = revisions.slice(0, limit);
+      const summaries = pageRows.map((record) => {
+        const auditId = textValue(record.audit_id);
+        const revisionId = textValue(record.id);
+        return {
+          ...taskSummary({
+            ...record,
+            id: auditId + ":revision:" + revisionId,
+            started_at: record.task_started_at,
+            completed_at: record.task_completed_at,
+            created_at: record.task_started_at || record.recorded_at,
+            updated_at: record.recorded_at,
+          }),
+          source_audit_id: auditId,
+          revision_id: revisionId,
+          snapshot_origin: record.snapshot_origin,
+          recorded_at: record.recorded_at,
+        };
+      });
+      return json(req, {
+        query_architecture: "usage_monitor_task_revisions_v1",
+        viewer_scope: scope.mode,
+        task_audits: summaries,
+        page_size: limit,
+        has_more: hasMore,
+        next_before_revision_id: hasMore && pageRows.length
+          ? textValue(pageRows[pageRows.length - 1].id)
+          : null,
+      });
+    }
     const beforeAuditId = textValue(body.before_audit_id);
     const anchor = await resolveAnchor(admin, scope, beforeAuditId);
     if (beforeAuditId && !anchor) return json(req, { error: "task_history_anchor_not_found" }, 404);

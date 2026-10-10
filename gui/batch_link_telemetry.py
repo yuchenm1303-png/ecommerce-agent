@@ -15,8 +15,10 @@ from app.providers.usage_telemetry import load_run_usage_summary
 
 from .app_access import ApplicationAccessController
 from .result_loader import load_run_result
+from .telemetry_delivery import window_durable_delivery
 from .task_failure_diagnostics import (
     collect_workflow_failure_diagnostic,
+    collect_workflow_log_chunks,
     sanitize_telemetry_value,
 )
 
@@ -199,6 +201,8 @@ class BatchLinkTelemetryController(QObject):
         self.window = window
         self.access = access
         self.network = QNetworkAccessManager(self)
+        self.delivery = window_durable_delivery(window, access)
+        self._enqueued_log_chunks: set[tuple[str, str, str, int]] = set()
         self._last_signatures: dict[str, str] = {}
         self._result_cache: dict[str, tuple[str, dict[str, Any]]] = {}
         self._batch_positions: dict[str, dict[str, int]] = {}
@@ -626,26 +630,48 @@ class BatchLinkTelemetryController(QObject):
                 continue
             self._last_signatures[audit_id] = signature
             self._post_audit(audit, session_id=session_id)
+            if terminal:
+                self._enqueue_terminal_logs(job, batch_id, job_id, audit_id, phase)
 
+    def _enqueue_terminal_logs(
+        self, job: Any, batch_id: str, job_id: str, audit_id: str, phase: str,
+    ) -> None:
+        run_dir = _text(getattr(job, "run_dir", ""), 2000)
+        if not run_dir:
+            return
+        diagnostics = Path(run_dir).parent / "diagnostics"
+        process_log = diagnostics / ("execute.log" if phase == "batch_execute" else "prepare.log")
+        try:
+            chunks = collect_workflow_log_chunks(run_dir, process_log_path=process_log)
+        except (OSError, ValueError) as exc:
+            print(f"[telemetry] cannot collect job logs: {type(exc).__name__}")
+            return
+        for chunk in chunks:
+            key = (audit_id, str(chunk["sha256"]), str(chunk["name"]), int(chunk["chunk_index"]))
+            if key in self._enqueued_log_chunks:
+                continue
+            try:
+                self.delivery.enqueue({
+                    "action": "task_log_chunk",
+                    "log_chunk": {
+                        "audit_id": audit_id,
+                        "batch_id": batch_id,
+                        "job_id": job_id,
+                        **chunk,
+                    },
+                })
+                self._enqueued_log_chunks.add(key)
+            except OSError as exc:
+                print(f"[telemetry] cannot persist task log chunk: {type(exc).__name__}")
+                return
 
     def _post_audit(self, audit: dict[str, Any], *, session_id: str) -> None:
-        session = self.access.session
-        payload = {
-            "action": "task_audit",
-            "user_id": session.user_id,
-            "device_id": session.device_id,
-            "session_id": session_id,
-            "telemetry_token": session.telemetry_token,
-            "app_version": self.access.installed_version,
-            "audit": _audit_payload(audit),
-        }
-        request = QNetworkRequest(QUrl(self.access.telemetry_function_url))
-        request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
-        reply = self.network.post(
-            request,
-            QByteArray(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
-        )
-        reply.finished.connect(reply.deleteLater)
+        # The central outbox removes events only after an acknowledged server write.
+        # session_id is refreshed when the request leaves disk; don't persist tokens.
+        try:
+            self.delivery.enqueue({"action": "task_audit", "audit": _audit_payload(audit)})
+        except OSError as exc:
+            print(f"[telemetry] cannot persist batch audit: {type(exc).__name__}")
 
 
 def install_batch_link_telemetry(
