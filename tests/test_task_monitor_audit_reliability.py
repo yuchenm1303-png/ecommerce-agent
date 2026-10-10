@@ -40,7 +40,8 @@ def test_all_task_publishers_use_acknowledged_outbox():
     assert 'response.get("accepted") is True' in delivery
     assert 'QTimer.singleShot(0, self.drain)' in delivery
     assert 'licensed_user' in delivery and 'licensed_device' in delivery
-    assert 'self.delivery.enqueue({"action": action, "audit": payload["audit"]})' in usage
+    assert 'self.delivery.enqueue(item)' in usage
+    assert 'if action in {"task_audit", "event"}' in usage
     assert '"action": "task_log_chunk"' in usage
     assert '"action": "task_log_chunk"' in batch
     assert 'self.delivery.enqueue({"action": "task_audit"' in batch
