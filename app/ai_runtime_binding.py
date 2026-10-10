@@ -123,7 +123,7 @@ def freeze_ai_runtime_environment(config: Any) -> None:
     key_env = str(getattr(config, "api_key_env", "") or "").strip()
     if not key_env or not os.getenv(key_env, "").strip():
         raise ValueError(f"当前任务的 AI API Key ({key_env or '未指定'}) 未配置。")
-    names = set(_AI_CHILD_ENV_NAMES)
+    names = set(_AI_CHILD_ENV_NAMES) - {_RUNTIME_KEY_ENV}
     names.add(key_env)
     config.runtime_ai_env = {
         name: value
