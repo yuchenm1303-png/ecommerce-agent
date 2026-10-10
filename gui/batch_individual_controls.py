@@ -235,6 +235,9 @@ class BatchIndividualControls(QObject):
             self.controller._persist_emit(immediate=True)
             self._pump_lanes()
         except Exception as exc:
+            monitor = getattr(self.workspace.window(), "_usage_telemetry", None)
+            if monitor is not None:
+                monitor.record_startup_failure("batch", "batch_prepare", str(exc), product_url=url)
             QMessageBox.critical(self.workspace, "单独启动失败", str(exc))
 
     def _append_job(self, url: str, config: RunnerConfig) -> BatchJob:

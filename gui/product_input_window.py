@@ -443,6 +443,9 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
             self.runner.start(config, mode="full")
             self.open_run_button.setEnabled(True)
         except Exception as exc:
+            monitor = getattr(self.window(), "_usage_telemetry", None)
+            if monitor is not None:
+                monitor.record_startup_failure("single", "listing_prepare", str(exc))
             QMessageBox.critical(self, "无法开始资料包任务", str(exc))
 
     @staticmethod

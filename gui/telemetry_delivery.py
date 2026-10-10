@@ -49,7 +49,7 @@ class DurableTelemetryDelivery(QObject):
 
     def enqueue(self, request: dict[str, Any]) -> None:
         action = str(request.get("action") or "").strip()
-        if action not in {"task_audit", "task_log_chunk"}:
+        if action not in {"task_audit", "task_log_chunk", "event"}:
             raise ValueError(f"unsupported durable telemetry action={action!r}")
         self.outbox.enqueue(request)
         self.drain()

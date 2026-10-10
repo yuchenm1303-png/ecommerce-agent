@@ -60,3 +60,22 @@ def test_server_accepts_log_chunks_and_revision_history_is_immutable():
     assert "after insert or update on public.listing_task_audits" in migration
     assert "is not distinct from" in migration
     assert "on delete cascade" not in migration
+
+
+
+def test_event_queue_and_ack_contract():
+    usage = _read("gui/usage_telemetry.py")
+    delivery = _read("gui/telemetry_delivery.py")
+    edge = _read("supabase/functions/portal-telemetry/index.ts")
+    schema = _read("supabase/migrations/20261010230000_listing_usage_event_delivery_idempotency.sql")
+    assert '"event_type": event_type, "outcome": outcome' in usage
+    assert '"client_event_id": str(uuid.uuid4())' in usage
+    assert 'if action not in {"task_audit", "task_log_chunk", "event"}' in delivery
+    assert "onConflict: \"client_event_id\"" in edge
+    assert "client_event_id uuid" in schema
+
+
+def test_ui_startup_exceptions_are_not_silently_swallowed():
+    for file in ("gui/batch_workspace.py", "gui/listing_offer_hardening.py",
+                 "gui/batch_individual_controls.py", "gui/product_input_window.py"):
+        assert 'record_startup_failure(' in _read(file), file

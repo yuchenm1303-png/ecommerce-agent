@@ -669,6 +669,9 @@ class BatchWorkspace(QWidget):
             self.controller.start_prepare(urls, config, prepare_concurrency=int(self.worker_count.value()))
             self.open_batch_button.setEnabled(True)
         except Exception as exc:
+            monitor = getattr(self.window(), "_usage_telemetry", None)
+            if monitor is not None:
+                monitor.record_startup_failure("batch", "batch_prepare", str(exc))
             QMessageBox.critical(self, "批量准备无法启动", str(exc))
 
     def _start_execution(self) -> None:
@@ -706,6 +709,9 @@ class BatchWorkspace(QWidget):
                 execute_concurrency=int(self.worker_count.value()),
             )
         except Exception as exc:
+            monitor = getattr(self.window(), "_usage_telemetry", None)
+            if monitor is not None:
+                monitor.record_startup_failure("batch", "batch_execute", str(exc))
             QMessageBox.critical(self, "批量填写无法启动", str(exc))
 
     @staticmethod

@@ -768,13 +768,17 @@ class UsageTelemetryController(QObject):
         elif action == "task_audit" and audit is not None:
             payload["audit"] = _safe_value(audit, max_text=_MAX_AUDIT_TEXT)
 
-        if action == "task_audit":
-            # Persist before sending; failed/late ACKs never silently erase a task.
+        if action in {"task_audit", "event"}:
+            # Persist before sending: event and audit failures must not disappear.
+            item = {"action": action, "audit": payload["audit"]} if action == "task_audit" else {
+                "action": "event", "event_type": event_type, "outcome": outcome,
+                "client_event_id": str(uuid.uuid4()), "event_occurred_at": _utc_now(),
+            }
             try:
-                self.delivery.enqueue({"action": action, "audit": payload["audit"]})
+                self.delivery.enqueue(item)
             except OSError as exc:
-                # Observability failure must never crash the user's Makro task.
-                print(f"[telemetry] cannot persist task audit: {type(exc).__name__}")
+                # Observability failure cannot crash the Makro user workflow.
+                print(f"[telemetry] cannot persist task {action}: {type(exc).__name__}")
             return
         request = QNetworkRequest(QUrl(self.access.telemetry_function_url))
         request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
@@ -1157,6 +1161,34 @@ class UsageTelemetryController(QObject):
             if jobs_changed is not None:
                 jobs_changed.connect(self._on_batch_jobs_changed)
 
+    def record_startup_failure(
+        self, task_kind: str, phase: str, error_text: str, *,
+        product_url: str = "", source_batch_id: str = "",
+    ) -> None:
+        """Record UI validation/launch exceptions before any runner emits 'running'.
+
+        User cancellation is deliberately excluded. An attempted workflow whose
+        launch raised is a real failure, even if no job object was created.
+        """
+        if not self._enabled():
+            return
+        normalized_kind = "batch" if task_kind == "batch" else "single"
+        normalized_phase = phase if phase in {
+            "listing_prepare", "listing_execute", "batch_prepare", "batch_execute"
+        } else ("batch_prepare" if normalized_kind == "batch" else "listing_prepare")
+        self._event(normalized_phase, "failed")
+        now = _utc_now()
+        self._task_audit(
+            str(uuid.uuid4()), task_kind=normalized_kind, phase=normalized_phase,
+            status="failed", product_url=_text(product_url, 4_096),
+            input_data={"audit_scope": "prestart_failure",
+                        "source_batch_id": _text(source_batch_id, 240)},
+            result_data={"failure_stage": "before_running",
+                         "error_origin": "ui_start_exception"},
+            error_text=_text(error_text, 12_000),
+            started_at=now, completed_at=now,
+        )
+
     def _on_prepare_running(self, running: bool) -> None:
         if running and not self._prepare_active:
             self._prepare_active = True
@@ -1199,6 +1231,14 @@ class UsageTelemetryController(QObject):
             self._enqueue_single_logs("listing_prepare")
 
     def _on_prepare_failed(self, *args: Any) -> None:
+        if not self._single_audit_id:
+            # Validation/startup errors can fire before running_changed(True).
+            self._single_audit_id = str(uuid.uuid4())
+            self._single_started_at = _utc_now()
+            self._single_input = self._single_input_snapshot()
+            self._single_result = {"failure_stage": "before_prepare_started"}
+        if not self._prepare_active:
+            self._event("listing_prepare", "failed")
         if self._prepare_active:
             self._prepare_active = False
             self._event("listing_prepare", "failed")
@@ -1280,6 +1320,14 @@ class UsageTelemetryController(QObject):
             self._enqueue_single_logs("listing_execute")
 
     def _on_execute_failed(self, *args: Any) -> None:
+        if not self._single_audit_id:
+            # Capture immediate execute errors, even when it never became running.
+            self._single_audit_id = str(uuid.uuid4())
+            self._single_started_at = _utc_now()
+            self._single_input = self._single_input_snapshot()
+            self._single_result = {"failure_stage": "before_execute_started"}
+        if not self._execute_active:
+            self._event("listing_execute", "failed")
         if self._execute_active:
             self._execute_active = False
             self._event("listing_execute", "failed")
@@ -1415,6 +1463,16 @@ class UsageTelemetryController(QObject):
 
     def _on_batch_failed(self, *args: Any) -> None:
         if not self._batch_event_type:
+            # A controller can fail validation before any lane becomes RUNNING.
+            # Preserve that coordinator failure separately from per-link jobs.
+            workspace = getattr(self.window, "batch_workspace", None)
+            controller = getattr(workspace, "controller", None)
+            batch = getattr(controller, "batch", None)
+            self.record_startup_failure(
+                "batch", "batch_prepare",
+                _error_text(args) or "Batch coordinator failed before starting",
+                source_batch_id=_text(getattr(batch, "batch_id", ""), 240),
+            )
             return
         workspace = getattr(self.window, "batch_workspace", None)
         controller = getattr(workspace, "controller", None)
