@@ -568,6 +568,7 @@ class BatchController(QObject):
             "--page-state-base-url", self.config.base_url,
             "--page-state-model", self.config.local_model,
             "--page-state-api-key-env", self.config.api_key_env,
+            "--page-state-ai-source", self.config.ai_source or "manual",
         ]
         if resume_interaction:
             args.append("--resume-source-interaction")
