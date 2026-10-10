@@ -36,13 +36,10 @@ from app.source_capture import (
 from app.source_interaction import (
     SOURCE_INTERACTION_EXIT_CODE,
     SOURCE_OUTCOME_FILENAME,
+    SourcePageStateDecisionError,
     configure_source_page_state_provider,
 )
 from app.workflow_diagnostics import configure_diagnostics, diag_event
-
-
-_DEFAULT_PAGE_STATE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-_DEFAULT_PAGE_STATE_MODEL = "qwen3.7-plus"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,9 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="openai-compatible",
         help="AI provider used only to judge the current Source Edge UI state.",
     )
-    parser.add_argument("--page-state-model", default=_DEFAULT_PAGE_STATE_MODEL)
-    parser.add_argument("--page-state-api-key-env", default="AI_API_KEY")
-    parser.add_argument("--page-state-base-url", default=_DEFAULT_PAGE_STATE_BASE_URL)
+    # The parent task must explicitly select Qwen or relay. Silent Qwen
+    # defaults made relay-enabled Batch jobs send relay keys to DashScope.
+    parser.add_argument("--page-state-model", required=True)
+    parser.add_argument("--page-state-api-key-env", required=True)
+    parser.add_argument("--page-state-base-url", required=True)
     parser.add_argument("--page-state-request-timeout-seconds", type=float, default=120.0)
     parser.add_argument(
         "--resume-source-interaction",
@@ -140,6 +139,8 @@ def main() -> int:
         resume_after_interaction=bool(args.resume_source_interaction),
         page_state_provider=str(args.page_state_provider),
         page_state_model=str(args.page_state_model),
+        page_state_base_url=str(args.page_state_base_url),
+        page_state_api_key_env=str(args.page_state_api_key_env),
     )
     try:
         captured = capture_product_source(
@@ -156,6 +157,43 @@ def main() -> int:
             force_refresh=False,
             resume_after_interaction=bool(args.resume_source_interaction),
         )
+    except SourcePageStateDecisionError as exc:
+        # A model/transport failure is not a supplier-page issue. Persist a
+        # machine-readable outcome so the GUI shows the cause instead of code=1.
+        message = str(exc)
+        authentication_failed = (
+            "invalid_api_key" in message.casefold()
+            or "authenticationerror" in message.casefold()
+            or "error code: 401" in message.casefold()
+        )
+        kind = "AI_AUTHENTICATION_FAILED" if authentication_failed else "AI_PAGE_STATE_FAILED"
+        detail = (
+            "AI API Key authentication failed (401) for the selected route."
+            if authentication_failed
+            else f"AI page-state decision failed: {type(exc).__name__}"
+        )
+        outcome = _write_source_outcome(
+            output_dir,
+            {
+                "outcome": "failed",
+                "checkpoint": "source_capture",
+                "product_url": args.product_url,
+                "failure_kind": kind,
+                "failure_reason": detail,
+                "page_state_model": str(args.page_state_model),
+                "page_state_base_url": str(args.page_state_base_url),
+                "browser_closed": False,
+            },
+        )
+        diag_event(
+            "batch_source_capture",
+            "FAILED",
+            error_type=kind,
+            detail=detail,
+            source_outcome=str(outcome.resolve()),
+        )
+        print(f"BATCH_SOURCE FAILED kind={kind} detail={detail}", flush=True)
+        return 1
     except SourceInteractionRequired as exc:
         outcome = _write_source_outcome(
             output_dir,
