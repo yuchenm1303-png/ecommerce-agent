@@ -23,6 +23,7 @@ from .batch_account_lanes import (
 from .batch_log_buffer import BATCH_LOG_FLUSH_LINES, BATCH_LOG_PENDING_LINES
 from app.ai_runtime_binding import (
     apply_active_ai_runtime,
+    ai_route_fingerprint,
     apply_child_ai_environment,
     freeze_ai_runtime_environment,
 )
@@ -401,6 +402,7 @@ class BatchController(QObject):
             prepare_concurrency=prepare_concurrency,
             execute_concurrency=prepare_concurrency,
         )
+        self.batch.ai_route_fingerprint = ai_route_fingerprint(config)
         self.batch.status = "PREPARING"
         self._mode = "prepare"
         self._stopping = False
