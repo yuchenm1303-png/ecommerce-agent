@@ -19,7 +19,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.ai_runtime_binding import apply_active_ai_runtime, freeze_ai_runtime_environment
+from app.ai_runtime_binding import (
+    ai_route_fingerprint,
+    apply_active_ai_runtime,
+    freeze_ai_runtime_environment,
+)
 from .batch_model import BatchJob, normalize_batch_concurrency
 from .listing_offer_support import _clean_intent, _write_intent_sidecar
 from .readonly_runner import RunnerConfig
@@ -245,6 +249,15 @@ class BatchIndividualControls(QObject):
         batch = self.controller.batch
         if batch is None:
             raise RuntimeError("Batch session is unavailable")
+
+        expected_route = str(getattr(batch, "ai_route_fingerprint", "") or "")
+        current_route = ai_route_fingerprint(config)
+        if expected_route and current_route != expected_route:
+            raise RuntimeError(
+                "这个 Batch 已绑定另一套 Qwen/中转站模型连接；切回原配置或新建 Batch 后再添加商品。"
+            )
+        if not expected_route:
+            batch.ai_route_fingerprint = current_route
 
         if self.controller.config is None:
             self.controller.config = config
