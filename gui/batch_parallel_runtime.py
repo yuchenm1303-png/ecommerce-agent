@@ -16,7 +16,11 @@ from .batch_browser_session import (
 from .batch_model import load_batch_run, normalize_batch_concurrency, save_batch_run
 from app.ai_profile_store import active_source_path
 from app.runtime_paths import is_frozen
-from app.ai_runtime_binding import apply_active_ai_runtime, freeze_ai_runtime_environment
+from app.ai_runtime_binding import (
+    ai_route_fingerprint,
+    apply_active_ai_runtime,
+    freeze_ai_runtime_environment,
+)
 from .readonly_runner import RunnerConfig
 
 
@@ -295,6 +299,11 @@ class BatchParallelRuntime:
         if active_source_path().is_file() or is_frozen():
             apply_active_ai_runtime(config)
         freeze_ai_runtime_environment(config)
+        expected_route = str(getattr(batch, "ai_route_fingerprint", "") or "")
+        if expected_route and ai_route_fingerprint(config) != expected_route:
+            raise RuntimeError(
+                "恢复的 Batch 与当前 AI 来源/模型连接不一致；请切回原来的 Qwen 或中转站配置后再继续。"
+            )
         if int(config.makro_cdp_port) != int(self.manager.port):
             raise RuntimeError(
                 "恢复 Batch 时当前工作区 Makro CDP 端口与账号专属 lane 不一致；已拒绝执行。"
