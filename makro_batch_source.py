@@ -64,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--page-state-model", required=True)
     parser.add_argument("--page-state-api-key-env", required=True)
     parser.add_argument("--page-state-base-url", required=True)
+    parser.add_argument("--page-state-ai-source", choices=("qwen", "relay", "manual"), default="manual")
     parser.add_argument("--page-state-request-timeout-seconds", type=float, default=120.0)
     parser.add_argument(
         "--resume-source-interaction",
@@ -141,6 +142,7 @@ def main() -> int:
         page_state_model=str(args.page_state_model),
         page_state_base_url=str(args.page_state_base_url),
         page_state_api_key_env=str(args.page_state_api_key_env),
+        page_state_ai_source=str(args.page_state_ai_source),
     )
     try:
         captured = capture_product_source(
@@ -182,6 +184,7 @@ def main() -> int:
                 "failure_reason": detail,
                 "page_state_model": str(args.page_state_model),
                 "page_state_base_url": str(args.page_state_base_url),
+                "page_state_ai_source": str(args.page_state_ai_source),
                 "browser_closed": False,
             },
         )
