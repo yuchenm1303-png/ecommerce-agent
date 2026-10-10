@@ -6,6 +6,8 @@ A batch account lane owns its in-memory route snapshot throughout the run.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from typing import Any
 
@@ -132,6 +134,27 @@ def freeze_ai_runtime_environment(config: Any) -> None:
     }
 
 
+def ai_route_fingerprint(config: Any) -> str:
+    """Hash route identity without writing a Base URL or secret to batch.json.
+
+    Credential rotation on the same provider/role route is allowed; switching
+    models/endpoints or Qwen versus relay requires a fresh batch.
+    """
+    env = getattr(config, "runtime_ai_env", {}) or {}
+    payload = {
+        "source": str(getattr(config, "ai_source", "") or "manual"),
+        "provider": str(getattr(config, "provider", "") or ""),
+        "semantic_url": str(getattr(config, "base_url", "") or ""),
+        "semantic_model": str(getattr(config, "local_model", "") or ""),
+        "fact_model": str(getattr(config, "fact_model", "") or ""),
+        "web_model": str(getattr(config, "web_model", "") or ""),
+        "fact_url": str(env.get(RUNTIME_FACT_BASE_URL_ENV, "") or ""),
+        "web_url": str(env.get(RUNTIME_WEB_BASE_URL_ENV, "") or ""),
+    }
+    content = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
 def apply_child_ai_environment(environment: Any, config: Any) -> None:
     """Remove inherited cross-lane credentials and inject this run's snapshot."""
     freeze_ai_runtime_environment(config)
@@ -144,5 +167,6 @@ def apply_child_ai_environment(environment: Any, config: Any) -> None:
 __all__ = [
     "apply_active_ai_runtime",
     "apply_child_ai_environment",
+    "ai_route_fingerprint",
     "freeze_ai_runtime_environment",
 ]
