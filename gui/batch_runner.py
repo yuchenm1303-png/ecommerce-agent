@@ -27,6 +27,7 @@ from app.ai_runtime_binding import (
     freeze_ai_runtime_environment,
 )
 from app.ai_profile_store import active_source_path
+from app.runtime_paths import is_frozen
 from app.batch_source_outcome import source_media_review
 from .batch_model import (
     BATCH_WORKER_DEFAULT,
@@ -390,7 +391,7 @@ class BatchController(QObject):
             raise RuntimeError("Batch 已在运行。")
         # Some per-row and recovered-batch entrypoints bypass the settings UI
         # wrapper. Resolve the saved profile here, before any worker is queued.
-        if not getattr(config, "runtime_ai_env", None) and active_source_path().is_file():
+        if not getattr(config, "runtime_ai_env", None) and (active_source_path().is_file() or is_frozen()):
             apply_active_ai_runtime(config)
         freeze_ai_runtime_environment(config)
         self.config = config
