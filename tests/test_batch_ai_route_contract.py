@@ -171,3 +171,39 @@ def test_batch_source_cli_never_falls_back_to_qwen():
     assert "apply_active_ai_runtime(config)" in individual
     assert "apply_active_ai_runtime(config)" in recovered
     assert 'kind == "AI_AUTHENTICATION_FAILED"' in batch
+
+
+def test_route_fingerprint_ignores_credentials_but_detects_source_switch():
+    relay = config()
+    relay.ai_source = "relay"
+    relay.base_url = "https://relay.example/v1"
+    relay.local_model = "gpt-custom"
+    relay.fact_model = "model-fact"
+    relay.web_model = "model-web"
+    relay.runtime_ai_env = {
+        "AI_API_KEY": "first-key",
+        runtime.RUNTIME_WEB_BASE_URL_ENV: "https://web.example/v1",
+        runtime.RUNTIME_WEB_KEY_ENV: "first-web-key",
+    }
+    signature = runtime.ai_route_fingerprint(relay)
+    assert len(signature) == 64
+    assert "first-key" not in signature
+    relay.runtime_ai_env["AI_API_KEY"] = "rotated-key"
+    relay.runtime_ai_env[runtime.RUNTIME_WEB_KEY_ENV] = "rotated-web-key"
+    assert runtime.ai_route_fingerprint(relay) == signature
+    relay.ai_source = "qwen"
+    assert runtime.ai_route_fingerprint(relay) != signature
+
+
+def test_batch_metadata_persists_ai_route_without_any_api_key(tmp_path):
+    from gui.batch_model import create_batch_run, load_batch_run, save_batch_run
+
+    batch = create_batch_run(tmp_path, ["https://example.org/product"])
+    batch.ai_route_fingerprint = "ab" * 32
+    save_batch_run(batch)
+    stored = (tmp_path / "logs" / "batch-runs" / batch.batch_id / "batch.json").read_text(
+        encoding="utf-8"
+    )
+    assert "ab" * 32 in stored
+    assert "AI_API_KEY" not in stored
+    assert load_batch_run(batch.root_dir).ai_route_fingerprint == "ab" * 32
