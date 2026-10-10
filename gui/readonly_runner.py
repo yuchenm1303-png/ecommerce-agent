@@ -6,13 +6,14 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 
+from app.ai_runtime_binding import apply_child_ai_environment, freeze_ai_runtime_environment
 from app.product_pack import SUPPORTED_PRODUCT_PACK_SUFFIXES
 from .async_run_journal import AsyncRunJournal
 from .result_loader import load_run_result
@@ -32,6 +33,8 @@ class RunnerConfig:
     fact_model: str = "qwen3.7-max"
     web_model: str = "qwen3.7-max"
     api_key_env: str = "AI_API_KEY"
+    ai_source: str = ""
+    runtime_ai_env: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
 
 
 _PHASE_META = {
@@ -96,6 +99,7 @@ class ReadOnlyRunner(QObject):
         if mode not in _MODE_PHASES:
             raise ValueError(f"未知 workflow mode={mode!r}")
         self._validate_config(config, mode=mode)
+        freeze_ai_runtime_environment(config)
 
         self.config = config
         self.mode = mode
@@ -219,6 +223,8 @@ class ReadOnlyRunner(QObject):
         environment = QProcessEnvironment.systemEnvironment()
         environment.insert("PYTHONUTF8", "1")
         environment.insert("PYTHONIOENCODING", "utf-8")
+        assert self.config is not None
+        apply_child_ai_environment(environment, self.config)
         process.setProcessEnvironment(environment)
         process.readyReadStandardOutput.connect(self._read_output)
         process.finished.connect(self._process_finished)
