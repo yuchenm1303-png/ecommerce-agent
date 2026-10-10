@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.ai_profile_store import active_source_path
+from app.ai_runtime_binding import apply_active_ai_runtime
 from .batch_model import BatchJob, normalize_batch_concurrency
 from .listing_offer_support import _clean_intent, _write_intent_sidecar
 from .readonly_runner import RunnerConfig
@@ -249,6 +251,22 @@ class BatchIndividualControls(QObject):
             self.controller.config = config
         elif not self.controller.is_running:
             self.controller.config = config
+        else:
+            existing = self.controller.config
+            if (
+                existing.ai_source,
+                existing.base_url,
+                existing.local_model,
+                existing.api_key_env,
+                existing.runtime_ai_env,
+            ) != (
+                config.ai_source,
+                config.base_url,
+                config.local_model,
+                config.api_key_env,
+                config.runtime_ai_env,
+            ):
+                raise RuntimeError("当前 Batch 正在使用另一套 AI 配置；请等这批任务结束后再切换来源或模型。")
 
         batch.prepare_concurrency = normalize_batch_concurrency(int(self.workspace.worker_count.value()))
         job_id = self._next_job_id()
@@ -286,12 +304,17 @@ class BatchIndividualControls(QObject):
         return f"JOB-{(max(numbers) + 1 if numbers else 1):03d}"
 
     def _runtime_config(self, url: str) -> RunnerConfig:
-        return RunnerConfig(
+        config = RunnerConfig(
             product_url=url,
             makro_cdp_port=int(self.workspace.makro_port.value()),
             source_cdp_port=int(self.workspace.source_port.value()),
             source_use_current_page=False,
         )
+        # A per-row Start may call the original controller method and bypass
+        # the global Batch settings wrapper; resolve the active route here too.
+        if active_source_path().is_file():
+            apply_active_ai_runtime(config)
+        return config
 
     # -------------------------------------------------------------- stop/delete
     def stop_row(self, row: Any) -> None:
