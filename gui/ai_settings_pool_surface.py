@@ -34,6 +34,7 @@ from app.ai_connection_probe import (
     probe_role,
     save_verification_snapshot,
 )
+from app.ai_runtime_binding import apply_active_ai_runtime
 from app.ai_profile_store import (
     AI_SOURCE_QWEN,
     AI_SOURCE_RELAY,
@@ -999,51 +1000,9 @@ class AISettingsModalController(_BaseAISettingsModalController):
             os.environ.pop(name, None)
 
     def _apply_runtime(self, config) -> None:
-        self._clear_role_runtime()
-        source = load_active_ai_source()
-        if source == AI_SOURCE_QWEN:
-            settings, key = load_qwen_profile()
-            config.provider = "openai-compatible"
-            config.base_url = settings.base_url
-            config.local_model = settings.model
-            config.fact_model = settings.fact_model
-            config.web_model = settings.web_model
-            config.api_key_env = _RUNTIME_KEY_ENV
-            os.environ[_RUNTIME_KEY_ENV] = key
-            return
-
-        pool = load_relay_pool()
-        if pool is None:
-            raise CapabilityProbeError("当前选择中转站，但连接池尚未配置。")
-        runtime_bindings: dict[str, RoleBinding] = {}
-        for role in _ROLES:
-            choice = pool.binding_for(role)
-            conn = pool.connection(choice.connection_id)
-            key = load_relay_connection_key(choice.connection_id)
-            if not key:
-                raise CapabilityProbeError(f"{_CONNECTION_LABELS[choice.connection_id]}缺少 API Key。")
-            runtime_bindings[role] = RoleBinding(role, conn.base_url, choice.model, key).normalized()
-        ordered = tuple(runtime_bindings[role] for role in _ROLES)
-        managed = assert_verified_if_managed(config_dir=relay_verification_directory(), bindings=ordered)
-        if not managed:
-            raise CapabilityProbeError("中转站连接池缺少能力验证记录，请先在设置中完成测试。")
-
-        semantic = runtime_bindings["semantic"]
-        fact = runtime_bindings["fact"]
-        web = runtime_bindings["web"]
-        config.provider = "openai-compatible"
-        config.base_url = semantic.base_url
-        config.local_model = semantic.model
-        config.fact_model = fact.model
-        config.web_model = web.model
-        config.api_key_env = _RUNTIME_KEY_ENV
-        os.environ[_RUNTIME_KEY_ENV] = semantic.api_key
-        if fact.base_url != semantic.base_url or fact.api_key != semantic.api_key:
-            os.environ[RUNTIME_FACT_BASE_URL_ENV] = fact.base_url
-            os.environ[RUNTIME_FACT_KEY_ENV] = fact.api_key
-        if web.base_url != semantic.base_url or web.api_key != semantic.api_key:
-            os.environ[RUNTIME_WEB_BASE_URL_ENV] = web.base_url
-            os.environ[RUNTIME_WEB_KEY_ENV] = web.api_key
+        # The Single and Batch entrypoints share one verified, frozen route.
+        # Per-row Batch starts and resumed lanes use this resolver too.
+        apply_active_ai_runtime(config)
 
 
 def install_ai_settings_modal(window) -> AISettingsModalController:
