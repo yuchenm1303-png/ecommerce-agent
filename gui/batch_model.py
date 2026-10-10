@@ -101,6 +101,7 @@ class BatchRun:
     makro_account_id: str = ""
     makro_account_label: str = ""
     makro_browser_instance_token: str = ""
+    ai_route_fingerprint: str = ""
     prepare_concurrency: int = BATCH_WORKER_DEFAULT
     execute_concurrency: int = BATCH_WORKER_DEFAULT
     save_authorized: bool = False
