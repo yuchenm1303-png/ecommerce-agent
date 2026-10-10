@@ -254,16 +254,24 @@ Deno.serve(async (req: Request) => {
   }
 
   if (action === "event") {
-    const { error } = await admin.from(EVENT_TABLE).insert({
+    const clientEventId = String(body.client_event_id || "").trim().toLowerCase();
+    if (clientEventId && !UUID_RE.test(clientEventId)) return json({ error: "invalid_event_id" }, 400);
+    const record = {
       user_id: userId,
       session_id: sessionId,
       device_id: deviceId,
       event_type: eventType,
       outcome,
       app_version: appVersion,
-      occurred_at: nowIso,
+      client_event_id: clientEventId || null,
+      // Keep the original event time across offline/timeout retries.
+      occurred_at: safeIso(body.event_occurred_at, nowIso) || nowIso,
       created_at: nowIso,
-    });
+    };
+    const insert = clientEventId
+      ? admin.from(EVENT_TABLE).upsert(record, { onConflict: "client_event_id", ignoreDuplicates: true })
+      : admin.from(EVENT_TABLE).insert(record);
+    const { error } = await insert;
     if (error) return json({ error: "event_write_failed" }, 503);
   }
 

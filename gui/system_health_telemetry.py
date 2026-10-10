@@ -347,6 +347,11 @@ class SystemHealthTelemetryController(QObject):
             "window": self._window_state(lag_ms),
             "task": self._task_state(),
             "telemetry": {
+                # Only the health request counter is transient; task audits are
+                # persisted in a separate, acknowledged disk-backed outbox.
+                "pending_task_uploads": len(getattr(
+                    getattr(getattr(self.window, "_durable_telemetry_delivery", None),
+                            "outbox", None), "pending_paths", lambda: [])()),
                 "last_request_latency_ms": round(self._last_request_latency_ms, 2),
                 "last_http_status": int(self._last_http_status),
                 "pending_requests": int(self._pending_requests),

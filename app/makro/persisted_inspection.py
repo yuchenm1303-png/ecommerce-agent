@@ -21,12 +21,12 @@ from .coverage import (
     _read_control,
     _unique_visible_locator,
     _value_controls,
-    _write_control,
     exercise_live_field,
     field_shape,
     semantic_field_is_empty,
     summarize_results,
 )
+from .field_engine import fill_control as _engine_fill_control
 from .direct_visual_hold import _listing_fields, _open_section
 from .listing_preflight import CORE_FORM_SECTIONS
 from .sections import cancel_section, save_section, visible_section_errors
@@ -134,7 +134,7 @@ def _apply_save_safe_overrides(
             if candidate not in options:
                 continue
 
-        _write_control(adapter.page, locator, control, candidate)
+        _engine_fill_control(adapter.page, control, candidate, section_path)
         immediate = _read_control(locator, control)
         adapter.page.wait_for_timeout(recheck_wait_ms)
         locator2, _ = _unique_visible_locator(adapter.page, section_path, control)

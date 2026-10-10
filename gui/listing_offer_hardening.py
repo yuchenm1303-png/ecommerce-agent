@@ -161,6 +161,9 @@ class ListingOfferHardening:
                 )
                 _workspace.open_batch_button.setEnabled(True)
             except Exception as exc:
+                monitor = getattr(_workspace.window(), "_usage_telemetry", None)
+                if monitor is not None:
+                    monitor.record_startup_failure("batch", "batch_prepare", str(exc))
                 QMessageBox.critical(_workspace, "批量准备无法启动", str(exc))
             finally:
                 self.controller._listing_offer_pending_intents = []

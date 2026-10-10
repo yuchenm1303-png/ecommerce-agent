@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -48,7 +49,7 @@ class DurableTelemetryDelivery(QObject):
 
     def enqueue(self, request: dict[str, Any]) -> None:
         action = str(request.get("action") or "").strip()
-        if action not in {"task_audit", "task_log_chunk"}:
+        if action not in {"task_audit", "task_log_chunk", "event"}:
             raise ValueError(f"unsupported durable telemetry action={action!r}")
         self.outbox.enqueue(request)
         self.drain()
@@ -120,7 +121,11 @@ class DurableTelemetryDelivery(QObject):
         if self.outbox.peek() is not None:
             if self._retry.isActive():
                 self._retry.stop()
-            self._retry.start()
+            if accepted:
+                # Drain acknowledged batches promptly; back off only on failure.
+                QTimer.singleShot(0, self.drain)
+            else:
+                self._retry.start()
 
     def _defer(self, item: QueuedTelemetryRequest, error: str) -> None:
         self.outbox.mark_failure(item, error)
@@ -129,4 +134,47 @@ class DurableTelemetryDelivery(QObject):
             self._retry.start()
 
 
-__all__ = ["DurableTelemetryDelivery"]
+def window_durable_delivery(window: QObject, access: Any) -> DurableTelemetryDelivery:
+    """One FIFO per window for both Single and Batch; survives app restart.
+
+    Credentials and the current session are resolved at send-time, never stored
+    in queued files. The telemetry outbox must not be bound to a Makro account.
+    """
+    existing = getattr(window, "_durable_telemetry_delivery", None)
+    if isinstance(existing, DurableTelemetryDelivery):
+        return existing
+
+    network = QNetworkAccessManager(window)
+    licensed_user = str(access.session.user_id)
+    licensed_device = str(access.session.device_id)
+    def base_payload(action: str) -> dict[str, Any]:
+        session = access.session
+        if session.user_id != licensed_user or session.device_id != licensed_device:
+            # Do not reassign a previous user's unsent audit to a new login.
+            raise ValueError("telemetry outbox belongs to another licensed identity")
+        usage = getattr(window, "_usage_telemetry", None)
+        if not getattr(usage, "session_id", ""):
+            raise ValueError("usage telemetry session is not initialized")
+        return {
+            "action": action,
+            "user_id": session.user_id,
+            "device_id": session.device_id,
+            "session_id": getattr(usage, "session_id", ""),
+            "telemetry_token": session.telemetry_token,
+            "app_version": access.installed_version,
+        }
+
+    root = Path(os.getenv("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    delivery = DurableTelemetryDelivery(
+        network,
+        endpoint=lambda: access.telemetry_function_url,
+        base_payload=base_payload,
+        outbox_root=root / "ListingStudio" / "telemetry-outbox" / licensed_user / licensed_device,
+        parent=window,
+    )
+    window._durable_telemetry_delivery = delivery
+    QTimer.singleShot(0, delivery.drain)
+    return delivery
+
+
+__all__ = ["DurableTelemetryDelivery", "window_durable_delivery"]
